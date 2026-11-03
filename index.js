@@ -1253,6 +1253,8 @@ export function apply(ctx, config) {
   const tagConfig = resolveTagConfig(config)
   /** 标签任务运行时状态（lastRunAt / lastError 只存在内存，不落盘）。 */
   const tagState = { running: false, lastRunAt: 0, lastError: null, chainBudget: tagConfig.tagMaxPerRun }
+  // 客户端半边自报的诊断（注册失败等），仅内存态、不落盘，用于排查 slot 注册异常。
+  const clientReport = { message: null, at: 0 }
   /** 插件生命周期（卸载时 abort 进行中的模型请求）。 */
   const tagLifecycle = new AbortController()
   let tagTimer = null
@@ -1686,6 +1688,7 @@ export function apply(ctx, config) {
       workspaces: listWorkspacesForPicker(),
       tags: buildTagCounts(displayedTagLists),
       tagging: tagPayload(),
+      client: { lastError: clientReport.message, lastAt: clientReport.at },
       summary,
       stats: {
         scanning: scanState.scanning,
@@ -2206,6 +2209,15 @@ export function apply(ctx, config) {
       case 'tagNow': {
         // 立刻强制跑一轮（不等待结果），客户端轮询 tagging.running/queued。
         kickTagNow()
+        break
+      }
+      case 'reportClientError': {
+        // 客户端 slot 注册失败等诊断上报（仅内存态，回报在 payload.client）。
+        const message = typeof body?.message === 'string' ? body.message.slice(0, 800) : ''
+        if (message.length > 0) {
+          clientReport.message = message
+          clientReport.at = Date.now()
+        }
         break
       }
       case 'refreshStats': {

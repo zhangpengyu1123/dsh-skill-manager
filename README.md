@@ -21,6 +21,8 @@
 
 ## 安装
 
+> 包名 `@local/dsh-skill-manager`：DSH 的本地/第三方插件命名；安装后侧边栏入口叫「技能」，Loader 行 id 为 `skill-manager`。
+
 ### 方式 A：DSH Web「插件」页（推荐）
 
 1. 打开 DSH Web，左侧点击「插件」。
@@ -36,7 +38,7 @@
 dsh plugin --profile web add git+https://github.com/zhangpengyu1123/dsh-skill-manager.git
 ```
 
-随后在 DSH Web「插件」页启用 `dsh-skill-manager`。
+随后在 DSH Web「插件」页启用 `@local/dsh-skill-manager`。
 
 ### 方式 C：本地目录调试
 
@@ -45,6 +47,8 @@ dsh plugin --profile web add /path/to/dsh-skill-manager
 ```
 
 并在「插件」页启用。
+
+> 注意：浏览器端插件模块的 `id` 必须与包名完全一致。若你修改了包名，请同步修改 `client.js` 里 `window.__ModuleLoader__.load({ id })`，并硬刷新一次 DSH 页面（否则旧页面会报 “loaded without registering”）。
 
 ## 使用
 

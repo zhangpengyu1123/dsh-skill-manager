@@ -13,7 +13,7 @@
  * required; every surface colour comes from the allowed theme tokens.
  */
 window.__ModuleLoader__.load({
-  id: 'dsh-skill-manager',
+  id: '@local/dsh-skill-manager',
   factory(require) {
     const React = require('react');
     const h = React.createElement;
@@ -2576,31 +2576,67 @@ window.__ModuleLoader__.load({
 
       const t = ctx.locale.bind(NS);
 
-      ctx.slots.inject('sidebar.panellist', function () {
-        return ctx.slots.register(
-          {
-            name: 'sidebar.panellist',
-            id: 'skill-manager',
-            order: 20,
-            locale: NS,
-            label: function () {
-              return t('nav');
-            },
-          },
-          SidebarSkillIcon,
-        );
-      });
+      // 注册失败自报：把异常回传给 Host（payload.client.lastError），便于排查槽位注册问题。
+      function reportRegistrationFailure(where, error) {
+        try {
+          if (typeof fetch !== 'function') return;
+          var message = where + ': ' + (error && error.message ? error.message : String(error));
+          fetch(API_PATH, {
+            method: 'POST',
+            headers: { 'content-type': 'application/json' },
+            body: JSON.stringify({ action: 'reportClientError', message: message }),
+          }).catch(function () {});
+        } catch (ignored) {
+          /* 诊断通道本身不可用则忽略 */
+        }
+      }
 
-      ctx.slots.inject('main', function () {
-        return ctx.slots.register(
-          {
-            name: 'main',
-            key: 'skill-manager',
-            locale: NS,
-          },
-          SkillManagerPage,
-        );
-      });
+      function registerGuarded(where, callback) {
+        try {
+          return callback();
+        } catch (error) {
+          reportRegistrationFailure(where, error);
+          throw error;
+        }
+      }
+
+      try {
+        ctx.slots.inject('sidebar.panellist', function () {
+          return registerGuarded('sidebar.panellist', function () {
+            return ctx.slots.register(
+              {
+                name: 'sidebar.panellist',
+                id: 'skill-manager',
+                order: 20,
+                locale: NS,
+                label: function () {
+                  return t('nav');
+                },
+              },
+              SidebarSkillIcon,
+            );
+          });
+        });
+      } catch (error) {
+        reportRegistrationFailure('inject-sidebar.panellist', error);
+      }
+
+      try {
+        ctx.slots.inject('main', function () {
+          return registerGuarded('main', function () {
+            return ctx.slots.register(
+              {
+                name: 'main',
+                key: 'skill-manager',
+                locale: NS,
+              },
+              SkillManagerPage,
+            );
+          });
+        });
+      } catch (error) {
+        reportRegistrationFailure('inject-main', error);
+      }
     }
 
     return {
