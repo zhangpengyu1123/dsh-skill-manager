@@ -21,24 +21,26 @@
 
 ## 安装
 
-> 包名 `@local/dsh-skill-manager`：DSH 的本地/第三方插件命名；安装后侧边栏入口叫「技能」，Loader 行 id 为 `skill-manager`。
+> 包名 `@local/dsh-skill-manager`（DSH 本地/第三方插件命名）；侧边栏入口叫「技能」，Loader 行 id 为 `skill-manager`。
+>
+> 前提：目标机器已装 **DSH 0.2.x**、**git** 可用、能访问 GitHub；仓库是公开的，无需账号。
 
-### 方式 A：DSH Web「插件」页（推荐）
+### 方式 A：DSH Web「插件」页（推荐，装完即启用）
 
 1. 打开 DSH Web，左侧点击「插件」。
 2. 点击「安装插件」，输入 Git 地址：
    ```text
    git+https://github.com/zhangpengyu1123/dsh-skill-manager.git
    ```
-3. 安装完成后启用；左侧导航出现「技能」。
+3. 安装完成后启用；左侧导航出现「技能」。若页面没刷新，重新打开 DSH 页面即可。
 
-### 方式 B：CLI
+### 方式 B：CLI（装完会自动写进 profile 的 bundles）
 
 ```bash
 dsh plugin --profile web add git+https://github.com/zhangpengyu1123/dsh-skill-manager.git
 ```
 
-随后在 DSH Web「插件」页启用 `@local/dsh-skill-manager`。
+随后重启 `dsh web`（或重开页面）即可；该命令会同时安装依赖并把 `@local/dsh-skill-manager` 加入该 profile 的 `dsh.profile.bundles`（实测于全新 profile）。
 
 ### 方式 C：本地目录调试
 
@@ -56,6 +58,24 @@ dsh plugin --profile web add /path/to/dsh-skill-manager
 2. 搜索 / 标签 / 时间 / 状态筛选 + 排序定位技能。
 3. 行尾开关启用或禁用；「⋯」打开项目可见范围、标签编辑、删除。
 4. 顶部「AI 标签」可立即触发一次批量打标签（空闲时也会自动进行）。
+
+### 首次安装后的行为
+
+- 打开面板立即渲染（读取本地缓存），技能清单与统计在后台扫描，列表上方会短暂显示「正在同步技能列表…」，完成后自动填入。
+- **AI 标签默认开启**：所有会话空闲且清单就绪后，约 45 秒开始自动打标（每批 ≤8 个技能、每个技能只打一次；30 个技能大约 4–6 次小请求）。首次使用会消耗少量模型 token。
+- 统计来自本机会话日志增量扫描，不会上传任何数据。
+
+### 配置
+
+可在 profile 的 `cordis.patch.yml`（`~/.dsh/profiles/web/cordis.patch.yml`）里覆盖行配置，例如关闭自动 AI 标签：
+
+```yaml
+- id: skill-manager
+  config:
+    autoTagEnabled: false
+```
+
+可调项（默认值）：`autoTagEnabled`(true)、`tagBatchSize`(8，1–12)、`tagMaxPerRun`(16，1–64)、`tagDelayMs`(45000)、`tagIntervalMs`(90000)、`tagBackoffMs`(600000)。
 
 ### 可见性规则
 
