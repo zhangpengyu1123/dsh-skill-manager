@@ -49,6 +49,9 @@ window.__ModuleLoader__.load({
       older: 'rangeOlder',
     };
 
+    /** Persisted list/cards layout preference. */
+    const LAYOUT_STORAGE_KEY = 'dsh-skill-manager:layout';
+
     /**
      * Last payload the host returned — module scoped, so it survives the page
      * component being unmounted/remounted (switching main panels). Reopening the
@@ -65,6 +68,9 @@ window.__ModuleLoader__.load({
      * call lossless (module scoped, so switching panels does not reset it).
      */
     let mutedTagsCache = {};
+
+    /** Module-scoped layout fallback so panel switches keep the chosen layout. */
+    let cachedLayout = null;
 
     /** Skill source → locale key. Unknown sources fall back to the raw value. */
     const SOURCE_LABELS = {
@@ -151,6 +157,9 @@ window.__ModuleLoader__.load({
       sortName: '名称 A→Z',
       sortInstalled: '安装时间 ↓',
       sortUpdated: '更新时间 ↓',
+      layoutLabel: '排版',
+      layoutList: '列表',
+      layoutCards: '卡片',
       filterButton: '筛选',
       filterButtonAria: '筛选（{count} 个条件）',
       filterTags: '标签（任一）',
@@ -246,6 +255,9 @@ window.__ModuleLoader__.load({
       sortName: 'Name A→Z',
       sortInstalled: 'Installed ↓',
       sortUpdated: 'Updated ↓',
+      layoutLabel: 'Layout',
+      layoutList: 'List',
+      layoutCards: 'Cards',
       filterButton: 'Filter',
       filterButtonAria: 'Filter ({count} active)',
       filterTags: 'Tags (any)',
@@ -521,10 +533,43 @@ window.__ModuleLoader__.load({
      * Small helpers
      * ------------------------------------------------------------------ */
 
+    /**
+     * Read the persisted list/cards choice. Order: module fallback (instant
+     * panel switches) → localStorage → default `'list'`; any failure falls back.
+     */
+    function readLayoutPreference() {
+      if (cachedLayout === 'list' || cachedLayout === 'cards') return cachedLayout;
+      let stored = null;
+      try {
+        if (typeof localStorage !== 'undefined' && localStorage && typeof localStorage.getItem === 'function') {
+          stored = localStorage.getItem(LAYOUT_STORAGE_KEY);
+        }
+      } catch (error) {
+        stored = null;
+      }
+      const layout = stored === 'cards' || stored === 'list' ? stored : 'list';
+      cachedLayout = layout;
+      return layout;
+    }
+
+    /** Persist the layout choice; storage failures keep the module fallback. */
+    function writeLayoutPreference(layout) {
+      if (layout !== 'list' && layout !== 'cards') return;
+      cachedLayout = layout;
+      try {
+        if (typeof localStorage !== 'undefined' && localStorage && typeof localStorage.setItem === 'function') {
+          localStorage.setItem(LAYOUT_STORAGE_KEY, layout);
+        }
+      } catch (error) {
+        /* Storage unavailable (privacy mode, quota): the module fallback stands. */
+      }
+    }
+
     /** Reopening the panel starts from the last payload, never from a skeleton. */
     function createInitialState() {
-      if (cachedPayload) return { status: 'ready', payload: cachedPayload, error: null };
-      return { status: 'loading', payload: null, error: null };
+      const layout = readLayoutPreference();
+      if (cachedPayload) return { status: 'ready', payload: cachedPayload, error: null, layout: layout };
+      return { status: 'loading', payload: null, error: null, layout: layout };
     }
 
     function hashName(name) {
@@ -556,6 +601,16 @@ window.__ModuleLoader__.load({
       if (!error) return '';
       if (typeof error === 'string') return error;
       return error.message ? String(error.message) : String(error);
+    }
+
+    /** `YYYY-MM-DD` in local time; an em dash for a missing timestamp. */
+    function formatDateShort(timestamp) {
+      if (typeof timestamp !== 'number' || !isFinite(timestamp) || timestamp <= 0) return '—';
+      const date = new Date(timestamp);
+      function pad(value) {
+        return value < 10 ? '0' + value : String(value);
+      }
+      return date.getFullYear() + '-' + pad(date.getMonth() + 1) + '-' + pad(date.getDate());
     }
 
     /** `YYYY-MM-DD HH:mm` in local time; an em dash for a missing timestamp. */
@@ -861,6 +916,70 @@ window.__ModuleLoader__.load({
       ]);
     }
 
+    function IconList() {
+      return svgBase(13, [
+        h('path', {
+          key: 'dots',
+          d: 'M2.8 4.2h.9M2.8 8h.9M2.8 11.8h.9',
+          stroke: 'currentColor',
+          strokeWidth: 1.6,
+          strokeLinecap: 'round',
+        }),
+        h('path', {
+          key: 'rows',
+          d: 'M6.3 4.2h6.9M6.3 8h6.9M6.3 11.8h6.9',
+          stroke: 'currentColor',
+          strokeWidth: 1.4,
+          strokeLinecap: 'round',
+        }),
+      ]);
+    }
+
+    function IconGrid() {
+      return svgBase(13, [
+        h('rect', {
+          key: 'a',
+          x: 2.5,
+          y: 2.5,
+          width: 4.6,
+          height: 4.6,
+          rx: 1.2,
+          stroke: 'currentColor',
+          strokeWidth: 1.35,
+        }),
+        h('rect', {
+          key: 'b',
+          x: 8.9,
+          y: 2.5,
+          width: 4.6,
+          height: 4.6,
+          rx: 1.2,
+          stroke: 'currentColor',
+          strokeWidth: 1.35,
+        }),
+        h('rect', {
+          key: 'c',
+          x: 2.5,
+          y: 8.9,
+          width: 4.6,
+          height: 4.6,
+          rx: 1.2,
+          stroke: 'currentColor',
+          strokeWidth: 1.35,
+        }),
+        h('rect', {
+          key: 'd',
+          x: 8.9,
+          y: 8.9,
+          width: 4.6,
+          height: 4.6,
+          rx: 1.2,
+          stroke: 'currentColor',
+          strokeWidth: 1.35,
+        }),
+      ]);
+    }
+
     /* --------------------------------------------------------------------
      * Sidebar entry icon: `{ size, active }`
      * ------------------------------------------------------------------ */
@@ -900,10 +1019,24 @@ window.__ModuleLoader__.load({
      * Presentation pieces
      * ------------------------------------------------------------------ */
 
-    function LoadingSkeleton() {
-      const cards = [];
+    /** Three-row skeleton; three grid cards when the cards layout is active. */
+    function LoadingSkeleton(props) {
+      const cardsLayout = !!(props && props.layout === 'cards');
+      const items = [];
       for (let index = 0; index < 3; index += 1) {
-        cards.push(
+        if (cardsLayout) {
+          items.push(
+            h(
+              'li',
+              { className: 'skm-gridCard skm-skGridCard', key: 'skm-sk-' + index },
+              h('div', { className: 'skm-skLine', 'data-w': 'name' }),
+              h('div', { className: 'skm-skLine', 'data-w': 'desc' }),
+              h('div', { className: 'skm-skLine', 'data-w': 'meta' }),
+            ),
+          );
+          continue;
+        }
+        items.push(
           h(
             'div',
             { className: 'skm-skCard', key: 'skm-sk-' + index },
@@ -917,7 +1050,11 @@ window.__ModuleLoader__.load({
           ),
         );
       }
-      return h('div', { className: 'skm-skeleton', 'aria-busy': 'true' }, cards);
+      return h(
+        cardsLayout ? 'ul' : 'div',
+        { className: cardsLayout ? 'skm-grid' : 'skm-skeleton', 'aria-busy': 'true' },
+        items,
+      );
     }
 
     function EmptyState(props) {
@@ -1245,26 +1382,248 @@ window.__ModuleLoader__.load({
       );
     }
 
+    /* --------------------------------------------------------------------
+     * Shared row/card renderers — one implementation for both layouts
+     * ------------------------------------------------------------------ */
+
+    function skillSourceText(t, skill) {
+      const sourceKey = SOURCE_LABELS[skill.source];
+      return sourceKey ? t(sourceKey) : skill.source || t('sourceOther');
+    }
+
+    /** Tag chips; `max` caps the visible count and appends a `+N` chip. */
+    function renderTagChips(options) {
+      const t = options.t;
+      const tags = options.tags || [];
+      if (tags.length === 0) return null;
+      const activeTags = options.activeTags || [];
+      const max = typeof options.max === 'number' ? options.max : tags.length;
+      const visible = tags.slice(0, max);
+      const hidden = tags.slice(max);
+      return h(
+        'span',
+        { className: options.className || 'skm-rowTags' },
+        visible.map(function (tag) {
+          const isAi = tag.source === 'ai';
+          const active = activeTags.indexOf(tag.text) !== -1;
+          return h(
+            'button',
+            {
+              key: 'skm-tag-' + tag.text,
+              type: 'button',
+              className: 'skm-tagChip' + (isAi ? ' skm-tagChipAi' : ''),
+              'aria-pressed': active ? 'true' : 'false',
+              title: isAi ? t('tagAiTooltip') : tag.text,
+              onClick: function (event) {
+                event.stopPropagation();
+                options.onTagToggle(tag.text);
+              },
+            },
+            isAi ? h('span', { className: 'skm-tagAiMark', 'aria-hidden': 'true' }, '\u2728') : null,
+            h('span', { className: 'skm-tagText' }, tag.text),
+          );
+        }),
+        hidden.length > 0
+          ? h(
+              'span',
+              {
+                className: 'skm-tagMore',
+                title: hidden
+                  .map(function (tag) {
+                    return tag.text;
+                  })
+                  .join(' · '),
+              },
+              '+' + hidden.length,
+            )
+          : null,
+      );
+    }
+
+    function renderSwitchButton(options) {
+      const t = options.t;
+      const skill = options.skill;
+      const label = t(skill.enabled ? 'disableSkill' : 'enableSkill', { name: skill.name });
+      return h(
+        'button',
+        {
+          type: 'button',
+          role: 'switch',
+          className: 'skm-switch',
+          'aria-checked': skill.enabled ? 'true' : 'false',
+          'aria-label': label,
+          title: label,
+          disabled: options.busy,
+          onClick: options.onToggleEnabled,
+        },
+        h('span', { className: 'skm-switchThumb' }),
+      );
+    }
+
+    /** ⋯ button + popover; identical in the list and the cards layout. */
+    function renderMenu(options) {
+      const t = options.t;
+      const skill = options.skill;
+      const menuId = 'skm-menu-' + skill.name;
+      const items = [
+        h(
+          'button',
+          { key: 'bindings', type: 'button', className: 'skm-menuItem', role: 'menuitem', onClick: options.onOpenDetail },
+          h(IconLink),
+          t('menuBindings'),
+        ),
+        h(
+          'button',
+          { key: 'tags', type: 'button', className: 'skm-menuItem', role: 'menuitem', onClick: options.onEditTags },
+          h(IconTag),
+          t('menuTags'),
+        ),
+      ];
+      if (skill.deletable) {
+        items.push(
+          h(
+            'button',
+            {
+              key: 'delete',
+              type: 'button',
+              className: 'skm-menuItem skm-menuDanger',
+              role: 'menuitem',
+              onClick: options.onAskDelete,
+            },
+            h(IconTrash),
+            t('menuDelete'),
+          ),
+        );
+      }
+      return h(
+        'div',
+        { className: 'skm-menuWrap', ref: options.open ? options.menuRef : undefined },
+        h(
+          'button',
+          {
+            type: 'button',
+            className: 'skm-iconBtn',
+            'aria-label': t('moreActions'),
+            'aria-haspopup': 'menu',
+            'aria-expanded': options.open ? 'true' : 'false',
+            'aria-controls': options.open ? menuId : undefined,
+            title: t('moreActions'),
+            ref: options.open ? options.menuTriggerRef : undefined,
+            onClick: options.onToggleMenu,
+            disabled: options.busy,
+          },
+          h(IconMore),
+        ),
+        options.open
+          ? h(
+              'div',
+              { className: 'skm-menu', id: menuId, role: 'menu', 'data-up': options.menuUp ? 'true' : 'false' },
+              items,
+            )
+          : null,
+      );
+    }
+
+    /** Expanded detail (workspace picker + tag editor), shared by row and card. */
+    function renderDetail(options) {
+      const t = options.t;
+      const skill = options.skill;
+      return h(
+        'div',
+        { id: 'skm-detail-' + skill.name, className: 'skm-detail' },
+        h(
+          'section',
+          { className: 'skm-detailSection' },
+          h('h3', { className: 'skm-detailHeading' }, t('detailWorkspaces')),
+          h(WorkspacePanel, {
+            t: t,
+            workspaces: options.workspaces,
+            selected: options.bound,
+            saving: options.busy,
+            currentWorkspaceId: options.currentWorkspaceId,
+            onToggle: options.onWorkspaceToggle,
+            onClear: options.onClearBindings,
+          }),
+        ),
+        h(
+          'section',
+          { className: 'skm-detailSection' },
+          h('h3', { className: 'skm-detailHeading' }, t('detailTags')),
+          h(TagsPanel, {
+            t: t,
+            skill: skill,
+            busy: options.tagBusy,
+            autoFocus: options.autoFocusTags,
+            onAdd: options.onTagAdd,
+            onRemove: options.onTagRemove,
+            onMute: options.onTagMute,
+          }),
+        ),
+      );
+    }
+
+    function renderDeleteConfirm(options) {
+      const t = options.t;
+      const skill = options.skill;
+      return h(
+        'div',
+        { className: 'skm-confirm', role: 'group', 'aria-label': t('menuDelete') },
+        h('span', { className: 'skm-confirmText' }, t('deleteConfirm', { name: skill.name })),
+        h(
+          'div',
+          { className: 'skm-confirmActions' },
+          h(
+            'button',
+            { type: 'button', className: 'skm-btn', onClick: options.onCancelDelete, disabled: options.busy },
+            t('cancel'),
+          ),
+          h(
+            'button',
+            { type: 'button', className: 'skm-btn skm-btnDanger', onClick: options.onDelete, disabled: options.busy },
+            options.busy ? t('deleting') : t('delete'),
+          ),
+        ),
+      );
+    }
+
+    /** Expand affordance: the same chevron button in rows and cards. */
+    function renderExpandButton(options) {
+      const t = options.t;
+      const open = !!options.open;
+      return h(
+        'button',
+        {
+          type: 'button',
+          className: 'skm-iconBtn',
+          'aria-label': t('detailToggle'),
+          'aria-expanded': open ? 'true' : 'false',
+          'aria-controls': open ? 'skm-detail-' + options.skill.name : undefined,
+          title: t('detailToggle'),
+          onClick: options.onToggleDetail,
+          disabled: options.busy,
+        },
+        h('span', { className: 'skm-chevron', 'data-open': open ? 'true' : 'false' }, h(IconChevron)),
+      );
+    }
+
+    /** List-layout row (unchanged markup/behaviour). */
     function SkillRow(props) {
       const t = props.t;
       const skill = props.skill;
       const boundCount = props.bound.length;
-      const openDetail = props.openDetail;
-      const openMenu = props.openMenu;
-      const confirming = props.confirming;
-      const sourceKey = SOURCE_LABELS[skill.source];
-      const sourceText = sourceKey ? t(sourceKey) : skill.source || t('sourceOther');
-      const tileLetter = (skill.name.charAt(0) || '?').toUpperCase();
-      const panelId = 'skm-detail-' + skill.name;
-      const menuId = 'skm-menu-' + skill.name;
+      const sourceText = skillSourceText(t, skill);
 
       return h(
         'li',
-        { className: 'skm-card', 'data-open': openDetail || confirming ? 'true' : 'false' },
+        { className: 'skm-card', 'data-open': props.openDetail || props.confirming ? 'true' : 'false' },
         h(
           'div',
           { className: 'skm-cardMain' },
-          h('div', { className: 'skm-tile', style: tileStyle(skill.name), 'aria-hidden': 'true' }, tileLetter),
+          h(
+            'div',
+            { className: 'skm-tile', style: tileStyle(skill.name), 'aria-hidden': 'true' },
+            (skill.name.charAt(0) || '?').toUpperCase(),
+          ),
           h(
             'div',
             { className: 'skm-body' },
@@ -1282,32 +1641,12 @@ window.__ModuleLoader__.load({
                   )
                 : null,
               h('span', { className: 'skm-calls' }, t('calls', { count: skill.calls })),
-              skill.tags.length > 0
-                ? h(
-                    'span',
-                    { className: 'skm-rowTags' },
-                    skill.tags.map(function (tag) {
-                      const isAi = tag.source === 'ai';
-                      const active = (props.activeTags || []).indexOf(tag.text) !== -1;
-                      return h(
-                        'button',
-                        {
-                          key: 'skm-row-tag-' + tag.text,
-                          type: 'button',
-                          className: 'skm-tagChip' + (isAi ? ' skm-tagChipAi' : ''),
-                          'aria-pressed': active ? 'true' : 'false',
-                          title: isAi ? t('tagAiTooltip') : tag.text,
-                          onClick: function (event) {
-                            event.stopPropagation();
-                            props.onTagToggle(tag.text);
-                          },
-                        },
-                        isAi ? h('span', { className: 'skm-tagAiMark', 'aria-hidden': 'true' }, '✨') : null,
-                        h('span', { className: 'skm-tagText' }, tag.text),
-                      );
-                    }),
-                  )
-                : null,
+              renderTagChips({
+                t: t,
+                tags: skill.tags,
+                activeTags: props.activeTags,
+                onTagToggle: props.onTagToggle,
+              }),
             ),
             h(
               'p',
@@ -1318,151 +1657,183 @@ window.__ModuleLoader__.load({
           h(
             'div',
             { className: 'skm-actions' },
-            h(
-              'button',
-              {
-                type: 'button',
-                className: 'skm-iconBtn',
-                'aria-label': t('detailToggle'),
-                'aria-expanded': openDetail ? 'true' : 'false',
-                'aria-controls': openDetail ? panelId : undefined,
-                title: t('detailToggle'),
-                onClick: props.onToggleDetail,
-                disabled: props.busy,
-              },
-              h('span', { className: 'skm-chevron', 'data-open': openDetail ? 'true' : 'false' }, h(IconChevron)),
-            ),
-            h(
-              'button',
-              {
-                type: 'button',
-                role: 'switch',
-                className: 'skm-switch',
-                'aria-checked': skill.enabled ? 'true' : 'false',
-                'aria-label': t(skill.enabled ? 'disableSkill' : 'enableSkill', { name: skill.name }),
-                title: t(skill.enabled ? 'disableSkill' : 'enableSkill', { name: skill.name }),
-                disabled: props.busy,
-                onClick: props.onToggleEnabled,
-              },
-              h('span', { className: 'skm-switchThumb' }),
-            ),
-            h(
-              'div',
-              { className: 'skm-menuWrap', ref: openMenu ? props.menuRef : undefined },
-              h(
-                'button',
-                {
-                  type: 'button',
-                  className: 'skm-iconBtn',
-                  'aria-label': t('moreActions'),
-                  'aria-haspopup': 'menu',
-                  'aria-expanded': openMenu ? 'true' : 'false',
-                  'aria-controls': openMenu ? menuId : undefined,
-                  title: t('moreActions'),
-                  ref: openMenu ? props.menuTriggerRef : undefined,
-                  onClick: props.onToggleMenu,
-                  disabled: props.busy,
-                },
-                h(IconMore),
-              ),
-              openMenu
-                ? h(
-                    'div',
-                    {
-                      className: 'skm-menu',
-                      id: menuId,
-                      role: 'menu',
-                      'data-up': props.menuUp ? 'true' : 'false',
-                    },
-                    h(
-                      'button',
-                      { type: 'button', className: 'skm-menuItem', role: 'menuitem', onClick: props.onOpenDetail },
-                      h(IconLink),
-                      t('menuBindings'),
-                    ),
-                    h(
-                      'button',
-                      { type: 'button', className: 'skm-menuItem', role: 'menuitem', onClick: props.onEditTags },
-                      h(IconTag),
-                      t('menuTags'),
-                    ),
-                    skill.deletable
-                      ? h(
-                          'button',
-                          {
-                            type: 'button',
-                            className: 'skm-menuItem skm-menuDanger',
-                            role: 'menuitem',
-                            onClick: props.onAskDelete,
-                          },
-                          h(IconTrash),
-                          t('menuDelete'),
-                        )
-                      : null,
-                  )
-                : null,
-            ),
+            renderExpandButton({
+              t: t,
+              skill: skill,
+              open: props.openDetail,
+              onToggleDetail: props.onToggleDetail,
+              busy: props.busy,
+            }),
+            renderSwitchButton({
+              t: t,
+              skill: skill,
+              busy: props.busy,
+              onToggleEnabled: props.onToggleEnabled,
+            }),
+            renderMenu({
+              t: t,
+              skill: skill,
+              open: props.openMenu,
+              busy: props.busy,
+              menuUp: props.menuUp,
+              menuRef: props.menuRef,
+              menuTriggerRef: props.menuTriggerRef,
+              onToggleMenu: props.onToggleMenu,
+              onOpenDetail: props.onOpenDetail,
+              onEditTags: props.onEditTags,
+              onAskDelete: props.onAskDelete,
+            }),
           ),
         ),
-        openDetail
+        props.openDetail
+          ? renderDetail({
+              t: t,
+              skill: skill,
+              workspaces: props.workspaces,
+              bound: props.bound,
+              busy: props.busy,
+              tagBusy: props.tagBusy,
+              autoFocusTags: props.autoFocusTags,
+              currentWorkspaceId: props.currentWorkspaceId,
+              onWorkspaceToggle: props.onWorkspaceToggle,
+              onClearBindings: props.onClearBindings,
+              onTagAdd: props.onTagAdd,
+              onTagRemove: props.onTagRemove,
+              onTagMute: props.onTagMute,
+            })
+          : null,
+        props.confirming
+          ? renderDeleteConfirm({
+              t: t,
+              skill: skill,
+              busy: props.busy,
+              onCancelDelete: props.onCancelDelete,
+              onDelete: props.onDelete,
+            })
+          : null,
+      );
+    }
+
+    /** Cards (grid) layout: compact stacked card, detail spans the full grid. */
+    function SkillCard(props) {
+      const t = props.t;
+      const skill = props.skill;
+      const boundCount = props.bound.length;
+      const sourceText = skillSourceText(t, skill);
+      const meta = [
+        h('span', { key: 'calls', className: 'skm-gridMetaText' }, t('calls', { count: skill.calls })),
+        h('span', { key: 'dot-1', className: 'skm-gridDot', 'aria-hidden': 'true' }),
+        h(
+          'span',
+          { key: 'updated', className: 'skm-gridMetaText' },
+          t('historyUpdated') + ' ' + formatDateShort(skill.updatedAt),
+        ),
+      ];
+      if (boundCount > 0) {
+        meta.push(h('span', { key: 'dot-2', className: 'skm-gridDot', 'aria-hidden': 'true' }));
+        meta.push(
+          h(
+            'span',
+            { key: 'bound', className: 'skm-gridMetaText' },
+            t('boundBadge', { count: boundCount }),
+          ),
+        );
+      }
+
+      return h(
+        'li',
+        {
+          className: 'skm-gridCard' + (props.openDetail ? ' skm-gridCardOpen' : ''),
+          'data-open': props.openDetail || props.confirming ? 'true' : 'false',
+        },
+        h(
+          'div',
+          { className: 'skm-gridHead' },
+          h(
+            'div',
+            { className: 'skm-gridTitleRow' },
+            h('span', { className: 'skm-name', title: skill.name }, skill.name),
+            h('span', { className: 'skm-badge' }, sourceText),
+          ),
+          h(
+            'div',
+            { className: 'skm-gridHeadActions' },
+            renderSwitchButton({
+              t: t,
+              skill: skill,
+              busy: props.busy,
+              onToggleEnabled: props.onToggleEnabled,
+            }),
+            renderMenu({
+              t: t,
+              skill: skill,
+              open: props.openMenu,
+              busy: props.busy,
+              menuUp: false,
+              menuRef: props.menuRef,
+              menuTriggerRef: props.menuTriggerRef,
+              onToggleMenu: props.onToggleMenu,
+              onOpenDetail: props.onOpenDetail,
+              onEditTags: props.onEditTags,
+              onAskDelete: props.onAskDelete,
+            }),
+          ),
+        ),
+        h(
+          'p',
+          { className: 'skm-desc' + (skill.description ? '' : ' skm-descEmpty') },
+          skill.description || t('noDescription'),
+        ),
+        skill.tags.length > 0
           ? h(
               'div',
-              { id: panelId, className: 'skm-detail' },
-              h(
-                'section',
-                { className: 'skm-detailSection' },
-                h('h3', { className: 'skm-detailHeading' }, t('detailWorkspaces')),
-                h(WorkspacePanel, {
-                  t: t,
-                  workspaces: props.workspaces,
-                  selected: props.bound,
-                  saving: props.busy,
-                  currentWorkspaceId: props.currentWorkspaceId,
-                  onToggle: props.onWorkspaceToggle,
-                  onClear: props.onClearBindings,
-                }),
-              ),
-              h(
-                'section',
-                { className: 'skm-detailSection' },
-                h('h3', { className: 'skm-detailHeading' }, t('detailTags')),
-                h(TagsPanel, {
-                  t: t,
-                  skill: skill,
-                  busy: props.tagBusy,
-                  autoFocus: props.autoFocusTags,
-                  onAdd: props.onTagAdd,
-                  onRemove: props.onTagRemove,
-                  onMute: props.onTagMute,
-                }),
-              ),
+              { className: 'skm-gridTags' },
+              renderTagChips({
+                t: t,
+                tags: skill.tags,
+                activeTags: props.activeTags,
+                onTagToggle: props.onTagToggle,
+                max: 3,
+              }),
             )
           : null,
-        confirming
-          ? h(
-              'div',
-              { className: 'skm-confirm', role: 'group', 'aria-label': t('menuDelete') },
-              h('span', { className: 'skm-confirmText' }, t('deleteConfirm', { name: skill.name })),
-              h(
-                'div',
-                { className: 'skm-confirmActions' },
-                h(
-                  'button',
-                  { type: 'button', className: 'skm-btn', onClick: props.onCancelDelete, disabled: props.busy },
-                  t('cancel'),
-                ),
-                h(
-                  'button',
-                  {
-                    type: 'button',
-                    className: 'skm-btn skm-btnDanger',
-                    onClick: props.onDelete,
-                    disabled: props.busy,
-                  },
-                  props.busy ? t('deleting') : t('delete'),
-                ),
-              ),
-            )
+        h(
+          'div',
+          { className: 'skm-gridMeta' },
+          meta,
+          renderExpandButton({
+            t: t,
+            skill: skill,
+            open: props.openDetail,
+            onToggleDetail: props.onToggleDetail,
+            busy: props.busy,
+          }),
+        ),
+        props.openDetail
+          ? renderDetail({
+              t: t,
+              skill: skill,
+              workspaces: props.workspaces,
+              bound: props.bound,
+              busy: props.busy,
+              tagBusy: props.tagBusy,
+              autoFocusTags: props.autoFocusTags,
+              currentWorkspaceId: props.currentWorkspaceId,
+              onWorkspaceToggle: props.onWorkspaceToggle,
+              onClearBindings: props.onClearBindings,
+              onTagAdd: props.onTagAdd,
+              onTagRemove: props.onTagRemove,
+              onTagMute: props.onTagMute,
+            })
+          : null,
+        props.confirming
+          ? renderDeleteConfirm({
+              t: t,
+              skill: skill,
+              busy: props.busy,
+              onCancelDelete: props.onCancelDelete,
+              onDelete: props.onDelete,
+            })
           : null,
       );
     }
@@ -1492,6 +1863,12 @@ window.__ModuleLoader__.load({
       const [filterOpen, setFilterOpen] = React.useState(false);
       const [confirming, setConfirming] = React.useState(null);
       const [refreshing, setRefreshing] = React.useState(false);
+      /* createInitialState already resolved the persisted layout preference. */
+      const [layoutMode, setLayoutMode] = React.useState(function () {
+        if (state.layout === 'cards') return 'cards';
+        if (state.layout === 'list') return 'list';
+        return readLayoutPreference();
+      });
 
       const aliveRef = React.useRef(true);
       const bindSeqRef = React.useRef({});
@@ -1854,6 +2231,46 @@ window.__ModuleLoader__.load({
         setFilter('all');
       }
 
+      /** Switch list/cards and persist it (module fallback + localStorage). */
+      function chooseLayout(next) {
+        if (next !== 'list' && next !== 'cards') return;
+        writeLayoutPreference(next);
+        setLayoutMode(next);
+      }
+
+      const layoutToggle = h(
+        'div',
+        { className: 'skm-segment', role: 'group', 'aria-label': t('layoutLabel') },
+        h(
+          'button',
+          {
+            type: 'button',
+            className: 'skm-segBtn',
+            'aria-pressed': layoutMode === 'list' ? 'true' : 'false',
+            'aria-label': t('layoutList'),
+            title: t('layoutList'),
+            onClick: function () {
+              chooseLayout('list');
+            },
+          },
+          h(IconList),
+        ),
+        h(
+          'button',
+          {
+            type: 'button',
+            className: 'skm-segBtn',
+            'aria-pressed': layoutMode === 'cards' ? 'true' : 'false',
+            'aria-label': t('layoutCards'),
+            title: t('layoutCards'),
+            onClick: function () {
+              chooseLayout('cards');
+            },
+          },
+          h(IconGrid),
+        ),
+      );
+
       const activeFilterCount =
         (tagFilter.length > 0 ? 1 : 0) +
         (installedRange !== 'all' ? 1 : 0) +
@@ -2160,7 +2577,14 @@ window.__ModuleLoader__.load({
         h('span', null, taggingRunning ? t('aiTaggingRunning') : t('aiTagButton')),
       );
 
-      const toolbarActions = h('div', { className: 'skm-toolbarActions' }, sortControl, filterControl, aiTagButton);
+      const toolbarActions = h(
+        'div',
+        { className: 'skm-toolbarActions' },
+        layoutToggle,
+        sortControl,
+        filterControl,
+        aiTagButton,
+      );
 
       /* The host may be rescanning skills while we already show rows. */
       const showSyncHint =
@@ -2260,7 +2684,7 @@ window.__ModuleLoader__.load({
           },
         });
       } else if (showSkeleton) {
-        listArea = h(LoadingSkeleton);
+        listArea = h(LoadingSkeleton, { layout: layoutMode });
       } else if (rows.length === 0) {
         listArea = h(EmptyState, {
           t: t,
@@ -2268,73 +2692,78 @@ window.__ModuleLoader__.load({
           onClear: clearFilters,
         });
       } else {
+        const buildItemProps = function (skill, index) {
+          return {
+            key: skill.name,
+            skill: skill,
+            t: t,
+            workspaces: workspaces,
+            currentWorkspaceId: currentWorkspaceId,
+            bound: boundFor(skill),
+            openDetail: detailOpen === skill.name,
+            autoFocusTags: detailOpen === skill.name && detailFocus === skill.name,
+            tagBusy: !!tagBusy[skill.name],
+            activeTags: tagFilter,
+            openMenu: menuOpen === skill.name,
+            confirming: confirming === skill.name,
+            busy: !!pending[skill.name],
+            menuUp: layoutMode === 'list' && index >= rows.length - 2,
+            menuRef: menuRef,
+            menuTriggerRef: menuTriggerRef,
+            onToggleDetail: function () {
+              toggleDetail(skill);
+            },
+            onOpenDetail: function () {
+              openDetail(skill, false);
+            },
+            onEditTags: function () {
+              openDetail(skill, true);
+            },
+            onTagToggle: function (text) {
+              toggleTagFilter(text);
+            },
+            onTagAdd: function (text) {
+              addUserTag(skill, text);
+            },
+            onTagRemove: function (text) {
+              removeUserTag(skill, text);
+            },
+            onTagMute: function (text) {
+              muteAiTag(skill, text);
+            },
+            onToggleEnabled: function () {
+              void toggleEnabled(skill);
+            },
+            onToggleMenu: function () {
+              setMenuOpen(menuOpen === skill.name ? null : skill.name);
+            },
+            onAskDelete: function () {
+              setMenuOpen(null);
+              setConfirming(skill.name);
+            },
+            onCancelDelete: function () {
+              setConfirming(null);
+            },
+            onDelete: function () {
+              void deleteSkill(skill);
+            },
+            onWorkspaceToggle: function (workspaceId) {
+              toggleWorkspace(skill, workspaceId);
+            },
+            onClearBindings: function () {
+              void saveWorkspaces(skill, []);
+            },
+          };
+        };
+
         listArea = h(
-              'ul',
-              { className: 'skm-list' },
-              rows.map(function (skill, index) {
-                return h(SkillRow, {
-                  key: skill.name,
-                  skill: skill,
-                  t: t,
-                  workspaces: workspaces,
-                  currentWorkspaceId: currentWorkspaceId,
-                  bound: boundFor(skill),
-                  openDetail: detailOpen === skill.name,
-                  autoFocusTags: detailOpen === skill.name && detailFocus === skill.name,
-                  tagBusy: !!tagBusy[skill.name],
-                  activeTags: tagFilter,
-                  openMenu: menuOpen === skill.name,
-                  confirming: confirming === skill.name,
-                  busy: !!pending[skill.name],
-                  menuUp: index >= rows.length - 2,
-                  menuRef: menuRef,
-                  menuTriggerRef: menuTriggerRef,
-                  onToggleDetail: function () {
-                    toggleDetail(skill);
-                  },
-                  onOpenDetail: function () {
-                    openDetail(skill, false);
-                  },
-                  onEditTags: function () {
-                    openDetail(skill, true);
-                  },
-                  onTagToggle: function (text) {
-                    toggleTagFilter(text);
-                  },
-                  onTagAdd: function (text) {
-                    addUserTag(skill, text);
-                  },
-                  onTagRemove: function (text) {
-                    removeUserTag(skill, text);
-                  },
-                  onTagMute: function (text) {
-                    muteAiTag(skill, text);
-                  },
-                  onToggleEnabled: function () {
-                    void toggleEnabled(skill);
-                  },
-                  onToggleMenu: function () {
-                    setMenuOpen(menuOpen === skill.name ? null : skill.name);
-                  },
-                  onAskDelete: function () {
-                    setMenuOpen(null);
-                    setConfirming(skill.name);
-                  },
-                  onCancelDelete: function () {
-                    setConfirming(null);
-                  },
-                  onDelete: function () {
-                    void deleteSkill(skill);
-                  },
-                  onWorkspaceToggle: function (workspaceId) {
-                    toggleWorkspace(skill, workspaceId);
-                  },
-                  onClearBindings: function () {
-                    void saveWorkspaces(skill, []);
-                  },
-                });
-              }),
-            );
+          'ul',
+          { className: layoutMode === 'cards' ? 'skm-grid' : 'skm-list' },
+          rows.map(function (skill, index) {
+            const itemProps = buildItemProps(skill, index);
+            return layoutMode === 'cards' ? h(SkillCard, itemProps) : h(SkillRow, itemProps);
+          }),
+        );
       }
 
       const content = h(
@@ -2537,6 +2966,30 @@ window.__ModuleLoader__.load({
 .skm-detail{display:flex;flex-direction:column;gap:12px;padding:0 12px 12px 14px}
 .skm-detailSection{display:flex;flex-direction:column;gap:6px}
 .skm-detailHeading{margin:0 0 0 2px;font-size:12px;font-weight:600;line-height:18px;color:var(--dsw-alias-label-secondary)}
+.skm-segment{display:inline-flex;align-items:center;gap:1px;height:28px;padding:2px;border:1px solid var(--dsw-alias-border-l1);border-radius:8px;background:transparent}
+.skm-segBtn{width:26px;height:22px;display:inline-flex;align-items:center;justify-content:center;padding:0;border:0;border-radius:6px;background:transparent;color:var(--dsw-alias-label-secondary);cursor:pointer;transition:background .12s ease,color .12s ease}
+.skm-segBtn:hover{color:var(--dsw-alias-label-primary);background:color-mix(in srgb,var(--dsw-alias-label-primary) 8%,transparent)}
+.skm-segBtn[aria-pressed="true"]{color:var(--dsw-alias-brand-primary);background:color-mix(in srgb,var(--dsw-alias-brand-primary) 14%,transparent)}
+.skm-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(240px,1fr));gap:10px;margin:0;padding:0;list-style:none}
+.skm-gridCard{display:flex;flex-direction:column;gap:8px;min-width:0;padding:12px;border:1px solid var(--dsw-alias-border-l1);border-radius:12px;background:var(--dsw-alias-bg-layer-1);transition:background .12s ease,border-color .12s ease}
+.skm-gridCard:hover{background:var(--dsw-alias-bg-layer-2);border-color:var(--dsw-alias-border-l2)}
+.skm-gridCard[data-open="true"]{grid-column:1 / -1}
+.skm-gridHead{display:flex;align-items:flex-start;justify-content:space-between;gap:8px}
+.skm-gridTitleRow{display:flex;align-items:center;gap:6px;min-width:0;flex-wrap:wrap}
+.skm-gridTitleRow .skm-name{min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.skm-gridHeadActions{display:flex;align-items:center;gap:2px;flex:none;margin:-5px -5px 0 0}
+.skm-gridCard .skm-desc{margin:0}
+.skm-gridTags{display:flex;flex-wrap:wrap;gap:4px;min-width:0}
+.skm-gridMeta{display:flex;align-items:center;gap:5px;min-width:0;margin-top:auto;font-size:11px;line-height:16px;color:var(--dsw-alias-label-secondary);overflow:hidden}
+.skm-gridMetaText{min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.skm-gridDot{width:2px;height:2px;flex:none;border-radius:50%;background:var(--dsw-alias-label-secondary);opacity:.6}
+.skm-gridMeta .skm-iconBtn{margin-left:auto}
+.skm-tagMore{display:inline-flex;align-items:center;height:18px;padding:0 5px;border:1px dashed var(--dsw-alias-border-l1);border-radius:5px;color:var(--dsw-alias-label-secondary);font-size:11px;line-height:16px;white-space:nowrap}
+.skm-gridCard .skm-detail{padding:10px 0 0;border-top:1px solid var(--dsw-alias-border-l1)}
+.skm-gridCard .skm-confirm{margin:0}
+.skm-skGridCard{min-height:104px;gap:10px}
+.skm-skLine[data-w="meta"]{width:46%}
+@media (max-width:560px){.skm-grid{grid-template-columns:1fr}}
 @media (max-width:720px){
 .skm-scroll{padding:18px 16px 40px}
 .skm-toolbar{gap:8px}
