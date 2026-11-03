@@ -1,0 +1,54 @@
+{
+  "name": "dsh-skill-manager",
+  "version": "1.0.0",
+  "private": false,
+  "type": "module",
+  "description": "Skills panel for the DSH Web sidebar: inventory, enable/disable, call statistics, tags, per-project visibility, and removal.",
+  "keywords": [
+    "dsh",
+    "deepseek-harness",
+    "cordis",
+    "plugin",
+    "skills",
+    "skill-manager",
+    "agent-skills"
+  ],
+  "license": "MIT",
+  "author": "zhangpengyu1123",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/zhangpengyu1123/dsh-skill-manager.git"
+  },
+  "homepage": "https://github.com/zhangpengyu1123/dsh-skill-manager",
+  "bugs": {
+    "url": "https://github.com/zhangpengyu1123/dsh-skill-manager/issues"
+  },
+  "exports": {
+    ".": "./index.js",
+    "./client": "./client.js",
+    "./locale/*.json": "./locale/*.json",
+    "./icon": "./icon.svg"
+  },
+  "files": [
+    "index.js",
+    "client.js",
+    "cordis.patch.yml",
+    "locale/*.json",
+    "icon.svg",
+    "README.md",
+    "LICENSE"
+  ],
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "platform": "web",
+      "immediately": true,
+      "inject": [
+        "@deepseek-ai/dsh-client-ui-layout",
+        "@deepseek-ai/dsh-client-ui-sidebar"
+      ]
+    }
+  }
+}
