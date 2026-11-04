@@ -29,6 +29,8 @@ window.__ModuleLoader__.load({
     const BINDING_LIMIT = 50;
     const TAG_TEXT_LIMIT = 24;
     const USER_TAG_LIMIT = 8;
+    /** One-shot notice lives for ~6 s, then dismisses itself. */
+    const NOTICE_TIMEOUT_MS = 6000;
 
     /** Sort modes for the toolbar sort control (default: most used first). */
     const SORT_OPTIONS = ['calls', 'name', 'installed', 'updated'];
@@ -194,6 +196,24 @@ window.__ModuleLoader__.load({
       cancel: '取消',
       delete: '删除',
       deleting: '删除中…',
+      updateCheck: '检查更新',
+      updateApply: '更新到 {version}',
+      updateApplying: '更新中…',
+      updateChecking: '检查中…',
+      updateAvailable: '可更新 · {version}',
+      updateUpdated: '已更新',
+      updateUpToDate: '已是最新',
+      updateFailed: '检查失败',
+      updateManual: '需手动更新',
+      updateBundled: '内置技能随插件更新',
+      updateNoRepo: '无关联代码仓',
+      updateOpenRepo: '打开代码仓',
+      updateDetailTitle: '版本与来源',
+      versionLabel: '版本',
+      repoLabel: '代码仓',
+      updateStateLabel: '更新状态',
+      checkedAtLabel: '最近检查 {time}',
+      updateNotApplicable: '暂无可用更新方式',
     };
 
     const en = {
@@ -292,6 +312,24 @@ window.__ModuleLoader__.load({
       cancel: 'Cancel',
       delete: 'Delete',
       deleting: 'Deleting…',
+      updateCheck: 'Check for updates',
+      updateApply: 'Update to {version}',
+      updateApplying: 'Updating…',
+      updateChecking: 'Checking…',
+      updateAvailable: 'Update available · {version}',
+      updateUpdated: 'Updated',
+      updateUpToDate: 'Up to date',
+      updateFailed: 'Update check failed',
+      updateManual: 'Manual update required',
+      updateBundled: 'Built-in skill updates with the plugin',
+      updateNoRepo: 'No linked repository',
+      updateOpenRepo: 'Open repository',
+      updateDetailTitle: 'Version & source',
+      versionLabel: 'Version',
+      repoLabel: 'Repository',
+      updateStateLabel: 'Update status',
+      checkedAtLabel: 'Last checked {time}',
+      updateNotApplicable: 'No update mechanism available',
     };
 
     function interpolate(template, params) {
@@ -363,6 +401,29 @@ window.__ModuleLoader__.load({
       return { text: text, count: asNumber(raw.count, 0) };
     }
 
+    /** Methods the UI acts on; anything else falls back to "no repo" logic. */
+    const UPDATE_REPO_METHODS = ['script', 'git', 'git-project', 'metadata'];
+
+    /**
+     * Per-skill update info. Unknown method/state strings are kept verbatim
+     * (they pass through), while the render logic maps anything unrecognised
+     * to safe defaults (no repo / plain check).
+     */
+    function normalizeSkillUpdate(raw) {
+      const src = raw && typeof raw === 'object' ? raw : {};
+      const method = asString(src.method, '');
+      const state = asString(src.state, '');
+      return {
+        method: method !== '' ? method : 'none',
+        state: state !== '' ? state : 'unknown',
+        latest: nonEmptyStringOrNull(src.latest),
+        message: nonEmptyStringOrNull(src.message),
+        checkedAt: asNumber(src.checkedAt, 0),
+        canApply: src.canApply === true,
+        busy: src.busy === true,
+      };
+    }
+
     function normalizeSkill(raw) {
       if (!raw || typeof raw !== 'object') return null;
       const name = asString(raw.name, '');
@@ -390,6 +451,10 @@ window.__ModuleLoader__.load({
         mutedTags: asArray(raw.mutedTags).filter(function (text) {
           return typeof text === 'string' && text !== '';
         }),
+        /* v4: detected source + update state (absent on older hosts). */
+        version: nonEmptyStringOrNull(raw.version),
+        repoUrl: nonEmptyStringOrNull(raw.repoUrl),
+        update: normalizeSkillUpdate(raw.update),
       };
     }
 
@@ -793,6 +858,34 @@ window.__ModuleLoader__.load({
       ]);
     }
 
+    /** External-link glyph for the "open repository" entries. */
+    function IconExternal() {
+      return svgBase(11, [
+        h('path', {
+          key: 'arrow',
+          d: 'M6.1 3.4h4.5v4.5',
+          stroke: 'currentColor',
+          strokeWidth: 1.35,
+          strokeLinecap: 'round',
+          strokeLinejoin: 'round',
+        }),
+        h('path', {
+          key: 'slash',
+          d: 'M10.6 3.4 5.6 8.4',
+          stroke: 'currentColor',
+          strokeWidth: 1.35,
+          strokeLinecap: 'round',
+        }),
+        h('path', {
+          key: 'box',
+          d: 'M8.6 9.2v2.1a1.1 1.1 0 0 1-1.1 1.1H3.4a1.1 1.1 0 0 1-1.1-1.1V7.2a1.1 1.1 0 0 1 1.1-1.1h2.1',
+          stroke: 'currentColor',
+          strokeWidth: 1.35,
+          strokeLinecap: 'round',
+        }),
+      ]);
+    }
+
     function IconClose() {
       return svgBase(12, [
         h('path', {
@@ -1088,6 +1181,46 @@ window.__ModuleLoader__.load({
           'div',
           { className: 'skm-emptyAction' },
           h('button', { type: 'button', className: 'skm-btn', onClick: props.onRetry }, t('retry')),
+        ),
+      );
+    }
+
+    /** Page-level one-shot notice (auto-dismisses; also clearable via ×). */
+    function NoticeBar(props) {
+      const t = props.t;
+      const notice = props.notice;
+      const onDismiss = props.onDismiss;
+      React.useEffect(
+        function () {
+          if (!notice) return undefined;
+          const timer = setTimeout(onDismiss, NOTICE_TIMEOUT_MS);
+          return function () {
+            clearTimeout(timer);
+          };
+        },
+        [notice ? notice.id : null],
+      );
+      if (!notice) return null;
+      const kindClass =
+        notice.kind === 'success'
+          ? ' skm-noticeSuccess'
+          : notice.kind === 'error'
+            ? ' skm-noticeError'
+            : ' skm-noticeInfo';
+      return h(
+        'div',
+        { className: 'skm-notice' + kindClass, role: 'status', 'aria-live': 'polite' },
+        h('span', { className: 'skm-noticeText' }, notice.text),
+        h(
+          'button',
+          {
+            type: 'button',
+            className: 'skm-noticeClose',
+            'aria-label': t('dismiss'),
+            title: t('dismiss'),
+            onClick: onDismiss,
+          },
+          h(IconClose),
         ),
       );
     }
@@ -1391,6 +1524,183 @@ window.__ModuleLoader__.load({
       return sourceKey ? t(sourceKey) : skill.source || t('sourceOther');
     }
 
+    /** Localized update-state label for the detail section. */
+    function updateStateText(t, update) {
+      if (update.state === 'up-to-date') return t('updateUpToDate');
+      if (update.state === 'available') return t('updateAvailable', { version: update.latest || '—' });
+      if (update.state === 'updated') return t('updateUpdated');
+      if (update.state === 'failed') return t('updateFailed');
+      if (update.state === 'not-applicable') return t('updateNotApplicable');
+      if (update.state === 'checking') return t('updateChecking');
+      return t('updateCheck');
+    }
+
+    /**
+     * The single update entry in the ⋯ menu. The local in-flight map wins over
+     * the payload `busy` flag, and unknown methods/states fall back safely.
+     */
+    function updateMenuEntry(t, skill, options) {
+      const update = skill.update;
+      const busy = options.updateBusy;
+      let label;
+      let disabled = false;
+      let onClick;
+      let className = 'skm-menuItem';
+      if (busy === 'apply') {
+        label = t('updateApplying');
+        disabled = true;
+      } else if (busy === 'check') {
+        label = t('updateChecking');
+        disabled = true;
+      } else if (update.method === 'bundled') {
+        label = t('updateBundled');
+        disabled = true;
+      } else if (UPDATE_REPO_METHODS.indexOf(update.method) === -1) {
+        label = t('updateNoRepo');
+        disabled = true;
+      } else if (update.state === 'available' && update.canApply) {
+        label = t('updateApply', { version: update.latest || '—' });
+        className += ' skm-menuItemPrimary';
+        onClick = options.onApplyUpdate;
+      } else if (update.state === 'available') {
+        label = t('updateManual');
+        disabled = true;
+      } else {
+        label = t('updateCheck');
+        onClick = options.onCheckUpdate;
+      }
+      return h(
+        'button',
+        {
+          key: 'update',
+          type: 'button',
+          className: className + (disabled ? ' skm-menuItemLong' : ''),
+          role: 'menuitem',
+          disabled: disabled,
+          title: disabled && update.message ? update.message : undefined,
+          onClick: onClick,
+        },
+        h(disabled ? IconLink : IconRefresh),
+        label,
+      );
+    }
+
+    /** "Open repository" entry; opens a new tab without leaking the referrer. */
+    function updateRepoEntry(t, skill, options) {
+      if (!skill.repoUrl) return null;
+      return h(
+        'button',
+        {
+          key: 'repo',
+          type: 'button',
+          className: 'skm-menuItem',
+          role: 'menuitem',
+          title: skill.repoUrl,
+          onClick: function (event) {
+            event.stopPropagation();
+            options.onOpenRepo();
+          },
+        },
+        h(IconExternal),
+        t('updateOpenRepo'),
+      );
+    }
+
+    /** "可更新" / "已更新" chips and the failed warning dot, both layouts. */
+    function renderUpdateBadges(options) {
+      const t = options.t;
+      const update = options.skill.update;
+      if (update.state === 'available') {
+        const canApply = update.canApply === true;
+        return h(
+          'button',
+          {
+            type: 'button',
+            className: 'skm-updateChip',
+            'aria-label': t('updateApply', { version: update.latest || '—' }),
+            title: canApply ? t('updateApply', { version: update.latest || '—' }) : update.message || t('updateManual'),
+            onClick: function (event) {
+              event.stopPropagation();
+              if (canApply) options.onApplyUpdate();
+            },
+          },
+          t('updateAvailable', { version: update.latest || '—' }),
+        );
+      }
+      if (update.state === 'updated') {
+        return h(
+          'span',
+          { className: 'skm-updateChip skm-updateChipOk', title: update.message || t('updateUpdated') },
+          t('updateUpdated'),
+        );
+      }
+      if (update.state === 'failed') {
+        return h('span', {
+          className: 'skm-warnDot',
+          title: update.message || t('updateFailed'),
+          'aria-label': update.message || t('updateFailed'),
+        });
+      }
+      return null;
+    }
+
+    /** Detail section 3: version, repository, and update state. */
+    function renderUpdateSection(options) {
+      const t = options.t;
+      const skill = options.skill;
+      const update = skill.update;
+      return h(
+        'section',
+        { className: 'skm-detailSection' },
+        h('h3', { className: 'skm-detailHeading' }, t('updateDetailTitle')),
+        h(
+          'div',
+          { className: 'skm-infoRow' },
+          h('span', { className: 'skm-infoLabel' }, t('versionLabel')),
+          h('span', { className: 'skm-infoValue' }, skill.version || '—'),
+        ),
+        h(
+          'div',
+          { className: 'skm-infoRow' },
+          h('span', { className: 'skm-infoLabel' }, t('repoLabel')),
+          skill.repoUrl
+            ? h(
+                'a',
+                {
+                  className: 'skm-repoLink',
+                  href: skill.repoUrl,
+                  target: '_blank',
+                  rel: 'noopener noreferrer',
+                  title: skill.repoUrl,
+                  onClick: function (event) {
+                    event.stopPropagation();
+                  },
+                },
+                skill.repoUrl,
+              )
+            : h('span', { className: 'skm-infoValue' }, '—'),
+        ),
+        h(
+          'div',
+          { className: 'skm-infoRow' },
+          h('span', { className: 'skm-infoLabel' }, t('updateStateLabel')),
+          h(
+            'span',
+            { className: 'skm-infoValue skm-infoStack' },
+            h('span', { className: 'skm-infoState' }, updateStateText(t, update)),
+            update.message ? h('span', { className: 'skm-infoMessage' }, update.message) : null,
+            update.checkedAt
+              ? h(
+                  'span',
+                  { className: 'skm-infoMeta' },
+                  t('checkedAtLabel', { time: formatDateTime(update.checkedAt) }),
+                )
+              : null,
+          ),
+        ),
+      );
+    }
+
     /** Tag chips; `max` caps the visible count and appends a `+N` chip. */
     function renderTagChips(options) {
       const t = options.t;
@@ -1495,6 +1805,11 @@ window.__ModuleLoader__.load({
           ),
         );
       }
+      /* v4: update group, appended after the existing items behind a separator. */
+      items.push(h('div', { key: 'update-sep', className: 'skm-menuSep', role: 'separator' }));
+      items.push(updateMenuEntry(t, skill, options));
+      const repoEntry = updateRepoEntry(t, skill, options);
+      if (repoEntry) items.push(repoEntry);
       return h(
         'div',
         { className: 'skm-menuWrap', ref: options.open ? options.menuRef : undefined },
@@ -1559,6 +1874,7 @@ window.__ModuleLoader__.load({
             onMute: options.onTagMute,
           }),
         ),
+        renderUpdateSection({ t: t, skill: skill }),
       );
     }
 
@@ -1640,6 +1956,11 @@ window.__ModuleLoader__.load({
                     t('boundBadge', { count: boundCount }),
                   )
                 : null,
+              renderUpdateBadges({
+                t: t,
+                skill: skill,
+                onApplyUpdate: props.onApplyUpdate,
+              }),
               h('span', { className: 'skm-calls' }, t('calls', { count: skill.calls })),
               renderTagChips({
                 t: t,
@@ -1682,6 +2003,10 @@ window.__ModuleLoader__.load({
               onOpenDetail: props.onOpenDetail,
               onEditTags: props.onEditTags,
               onAskDelete: props.onAskDelete,
+              updateBusy: props.updateBusy,
+              onCheckUpdate: props.onCheckUpdate,
+              onApplyUpdate: props.onApplyUpdate,
+              onOpenRepo: props.onOpenRepo,
             }),
           ),
         ),
@@ -1754,6 +2079,11 @@ window.__ModuleLoader__.load({
             { className: 'skm-gridTitleRow' },
             h('span', { className: 'skm-name', title: skill.name }, skill.name),
             h('span', { className: 'skm-badge' }, sourceText),
+            renderUpdateBadges({
+              t: t,
+              skill: skill,
+              onApplyUpdate: props.onApplyUpdate,
+            }),
           ),
           h(
             'div',
@@ -1776,6 +2106,10 @@ window.__ModuleLoader__.load({
               onOpenDetail: props.onOpenDetail,
               onEditTags: props.onEditTags,
               onAskDelete: props.onAskDelete,
+              updateBusy: props.updateBusy,
+              onCheckUpdate: props.onCheckUpdate,
+              onApplyUpdate: props.onApplyUpdate,
+              onOpenRepo: props.onOpenRepo,
             }),
           ),
         ),
@@ -1863,6 +2197,9 @@ window.__ModuleLoader__.load({
       const [filterOpen, setFilterOpen] = React.useState(false);
       const [confirming, setConfirming] = React.useState(null);
       const [refreshing, setRefreshing] = React.useState(false);
+      /* v4: local in-flight map for skillUpdate (payload `busy` is not enough). */
+      const [updating, setUpdating] = React.useState({});
+      const [notice, setNotice] = React.useState(null);
       /* createInitialState already resolved the persisted layout preference. */
       const [layoutMode, setLayoutMode] = React.useState(function () {
         if (state.layout === 'cards') return 'cards';
@@ -1873,6 +2210,9 @@ window.__ModuleLoader__.load({
       const aliveRef = React.useRef(true);
       const bindSeqRef = React.useRef({});
       const tagSeqRef = React.useRef({});
+      const noticeSeqRef = React.useRef(0);
+      /* Synchronous guard: a second click must not fire a second slow POST. */
+      const updatingRef = React.useRef({});
       const menuRef = React.useRef(null);
       const menuTriggerRef = React.useRef(null);
       const sortRef = React.useRef(null);
@@ -2204,6 +2544,73 @@ window.__ModuleLoader__.load({
           else void fetchAndApply(true);
         } catch (error) {
           reportError(error);
+        }
+      }
+
+      function showNotice(kind, text) {
+        noticeSeqRef.current += 1;
+        setNotice({ id: noticeSeqRef.current, kind: kind, text: text });
+      }
+
+      function dismissNotice() {
+        setNotice(null);
+      }
+
+      /** Map a fresh `update` object to the transient notice kind + copy. */
+      function noticeForUpdate(update) {
+        const info = update || { state: 'unknown', message: null, latest: null };
+        if (info.state === 'up-to-date') showNotice('success', info.message || t('updateUpToDate'));
+        else if (info.state === 'available')
+          showNotice('info', info.message || t('updateAvailable', { version: info.latest || '—' }));
+        else if (info.state === 'updated') showNotice('success', info.message || t('updateUpdated'));
+        else if (info.state === 'failed') showNotice('error', info.message || t('updateFailed'));
+        else if (info.state === 'not-applicable') showNotice('info', info.message || t('updateNotApplicable'));
+        else showNotice('info', info.message || t('updateCheck'));
+      }
+
+      /**
+       * `skillUpdate` may take ~60 s (network check / real update). The local
+       * `updating` map drives the per-skill "checking/applying" item only.
+       */
+      async function runSkillUpdate(skill, apply) {
+        const name = skill.name;
+        if (updating[name] || updatingRef.current[name]) return;
+        updatingRef.current[name] = apply ? 'apply' : 'check';
+        setUpdating(function (previous) {
+          const next = Object.assign({}, previous);
+          next[name] = apply ? 'apply' : 'check';
+          return next;
+        });
+        try {
+          const nextPayload = await postAction('skillUpdate', apply ? { name: name, apply: true } : { name: name });
+          if (nextPayload) applyPayload(nextPayload);
+          const source = nextPayload && nextPayload.skills ? nextPayload.skills : skills;
+          const fresh = source.filter(function (entry) {
+            return entry.name === name;
+          })[0];
+          noticeForUpdate(fresh ? fresh.update : null);
+        } catch (error) {
+          showNotice('error', errorMessage(error) || t('updateFailed'));
+        } finally {
+          delete updatingRef.current[name];
+          setUpdating(function (previous) {
+            const next = Object.assign({}, previous);
+            delete next[name];
+            return next;
+          });
+        }
+      }
+
+      /** Open the detected repository in a new tab (popup blockers are harmless). */
+      function openSkillRepo(skill) {
+        const url = skill.repoUrl;
+        if (typeof url !== 'string' || url === '') return;
+        try {
+          if (typeof window !== 'undefined' && window && typeof window.open === 'function') {
+            window.open(url, '_blank', 'noopener,noreferrer');
+          }
+        } catch (error) {
+          /* Blocked popup: nothing else to do. */
         }
       }
 
@@ -2707,6 +3114,7 @@ window.__ModuleLoader__.load({
             openMenu: menuOpen === skill.name,
             confirming: confirming === skill.name,
             busy: !!pending[skill.name],
+            updateBusy: updating[skill.name] || null,
             menuUp: layoutMode === 'list' && index >= rows.length - 2,
             menuRef: menuRef,
             menuTriggerRef: menuTriggerRef,
@@ -2753,6 +3161,15 @@ window.__ModuleLoader__.load({
             onClearBindings: function () {
               void saveWorkspaces(skill, []);
             },
+            onCheckUpdate: function () {
+              void runSkillUpdate(skill, false);
+            },
+            onApplyUpdate: function () {
+              void runSkillUpdate(skill, true);
+            },
+            onOpenRepo: function () {
+              openSkillRepo(skill);
+            },
           };
         };
 
@@ -2772,6 +3189,7 @@ window.__ModuleLoader__.load({
         h('div', { className: 'skm-toolbar' }, searchField, chipList, toolbarActions),
         statsLine,
         errorBar,
+        h(NoticeBar, { t: t, notice: notice, onDismiss: dismissNotice }),
         listArea,
       );
 
@@ -2944,6 +3362,31 @@ window.__ModuleLoader__.load({
 .skm-filterFooter{display:flex;justify-content:flex-end;padding-top:8px}
 .skm-aiStatus{display:inline-flex;align-items:center;gap:6px;color:var(--dsw-alias-label-secondary);font-size:11px;line-height:18px}
 .skm-warnDot{width:6px;height:6px;flex:none;border-radius:50%;background:var(--dsw-alias-state-warn-primary)}
+.skm-updateChip{display:inline-flex;align-items:center;height:18px;padding:0 6px;border:1px solid color-mix(in srgb,var(--dsw-alias-brand-primary) 30%,transparent);border-radius:5px;background:color-mix(in srgb,var(--dsw-alias-brand-primary) 12%,transparent);color:var(--dsw-alias-brand-primary);font:inherit;font-size:11px;line-height:16px;white-space:nowrap;cursor:pointer;transition:background .12s ease,border-color .12s ease}
+.skm-updateChip:hover{background:color-mix(in srgb,var(--dsw-alias-brand-primary) 20%,transparent);border-color:color-mix(in srgb,var(--dsw-alias-brand-primary) 42%,transparent)}
+.skm-updateChipOk{border-color:color-mix(in srgb,var(--dsw-alias-state-success-primary) 30%,transparent);background:color-mix(in srgb,var(--dsw-alias-state-success-primary) 12%,transparent);color:var(--dsw-alias-state-success-primary);cursor:default}
+.skm-menuSep{height:1px;margin:4px 2px;background:var(--dsw-alias-border-l1);flex:none}
+.skm-menuItemPrimary{color:var(--dsw-alias-brand-primary)}
+.skm-menuItemPrimary svg{color:var(--dsw-alias-brand-primary)}
+.skm-menuItemLong{white-space:normal;line-height:18px;text-align:left}
+.skm-menuItem:disabled{opacity:.6;cursor:default}
+.skm-menuItem:disabled:hover{background:transparent}
+.skm-notice{display:flex;align-items:flex-start;gap:10px;margin:0 0 12px;padding:8px 8px 8px 12px;border:1px solid var(--dsw-alias-border-l1);border-radius:10px;background:var(--dsw-alias-bg-layer-1);font-size:12px;line-height:18px;color:var(--dsw-alias-label-primary)}
+.skm-noticeInfo{border-color:color-mix(in srgb,var(--dsw-alias-brand-primary) 26%,transparent);background:color-mix(in srgb,var(--dsw-alias-brand-primary) 8%,transparent)}
+.skm-noticeSuccess{border-color:color-mix(in srgb,var(--dsw-alias-state-success-primary) 30%,transparent);background:color-mix(in srgb,var(--dsw-alias-state-success-primary) 9%,transparent)}
+.skm-noticeError{border-color:color-mix(in srgb,var(--dsw-alias-state-error-primary) 36%,transparent);background:color-mix(in srgb,var(--dsw-alias-state-error-primary) 8%,transparent)}
+.skm-noticeText{flex:1;min-width:0;overflow-wrap:anywhere}
+.skm-noticeClose{width:20px;height:20px;flex:none;display:inline-flex;align-items:center;justify-content:center;padding:0;border:0;border-radius:6px;background:transparent;color:var(--dsw-alias-label-secondary);cursor:pointer}
+.skm-noticeClose:hover{color:var(--dsw-alias-label-primary);background:color-mix(in srgb,var(--dsw-alias-label-primary) 12%,transparent)}
+.skm-infoRow{display:flex;align-items:flex-start;gap:10px;font-size:12px;line-height:18px}
+.skm-infoLabel{flex:none;width:64px;color:var(--dsw-alias-label-secondary)}
+.skm-infoValue{flex:1;min-width:0;color:var(--dsw-alias-label-primary);overflow-wrap:anywhere}
+.skm-infoStack{display:flex;flex-direction:column;gap:2px}
+.skm-infoState{color:var(--dsw-alias-label-primary)}
+.skm-infoMessage{color:var(--dsw-alias-label-secondary)}
+.skm-infoMeta{color:var(--dsw-alias-label-secondary);font-size:11px;font-variant-numeric:tabular-nums}
+.skm-repoLink{color:var(--dsw-alias-brand-primary);text-decoration:none;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;display:inline-block;max-width:100%;vertical-align:bottom}
+.skm-repoLink:hover{text-decoration:underline}
 .skm-rowTags{display:inline-flex;align-items:center;gap:4px;flex-wrap:wrap}
 .skm-tagChip{display:inline-flex;align-items:center;gap:4px;height:18px;padding:0 6px;border:1px solid var(--dsw-alias-border-l1);border-radius:5px;background:color-mix(in srgb,var(--dsw-alias-label-primary) 5%,transparent);color:var(--dsw-alias-label-secondary);font:inherit;font-size:11px;line-height:16px;white-space:nowrap;cursor:pointer;transition:background .12s ease,border-color .12s ease,color .12s ease}
 .skm-tagChip:hover{color:var(--dsw-alias-label-primary);border-color:var(--dsw-alias-border-l2)}

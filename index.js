@@ -16,7 +16,10 @@
  *  5. 删除技能时移动到 `<DSH_HOME>/skill-trash`（bundled / node_modules 内置技能拒绝删除）。
  *  6. AI 标签（契约 v3 §3）：空闲时用默认模型批量生成中文标签；已标注过的技能不重标；
  *     `tagNow` 可强制立刻跑一轮；模型缺失时降级为 tagging.enabled=false。
- *  7. 只读调试入口 `GET /skill-manager/api?debug=resolve[&session=<id>][&cwd=<path>]`：
+ *  7. 更新检测 / 更新执行（契约 v4 §1–2）：清单刷新时按 script / git / git-project /
+ *     metadata / bundled 检测更新方式并缓存进 known；`POST {action:"skillUpdate"}`
+ *     用固定参数的 spawnSync 执行检查（可选 apply），结果写 state.updates。
+ *  8. 只读调试入口 `GET /skill-manager/api?debug=resolve[&session=<id>][&cwd=<path>]`：
  *     返回 cwd→workspace 解析结果，以及无作用域 / 给定会话作用域下 `ctx.skills.list()`
  *     的注册表解析结果（用于验收门禁）。
  *
@@ -27,6 +30,7 @@
 import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
+import { spawnSync } from 'node:child_process'
 
 export const name = 'skill-manager'
 export const inject = ['skills', 'webServer']
@@ -108,6 +112,32 @@ const TAG_CONFIG_DEFAULTS = Object.freeze({
 })
 /** 标签错误信息落 payload 时的最大长度。 */
 const TAG_ERROR_LIMIT = 200
+
+/* ---- 更新检测 / 更新（契约 v4） ---- */
+/** 更新方式。 */
+const UPDATE_METHODS = new Set(['script', 'git', 'git-project', 'metadata', 'none', 'bundled'])
+/** 更新状态（`checking` 只是运行中的瞬态，落盘读取时会回退为 unknown）。 */
+const UPDATE_STATES = new Set(['unknown', 'checking', 'up-to-date', 'available', 'updated', 'failed', 'not-applicable'])
+/** 版本号形状（x.y / x.y.z，可带预发布后缀）。 */
+const VERSION_PATTERN = /^\d+\.\d+(?:\.\d+)?(?:[-+][0-9A-Za-z.-]+)?$/
+/** 从文本里提取三段的版本号。 */
+const VERSION_TRIPLE_IN_TEXT = /(\d+\.\d+\.\d+)/g
+/** README 里可用的 GitHub 仓库链接。 */
+const GITHUB_URL_PATTERN = /https:\/\/github\.com\/[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+/g
+/** update.message 的最大长度。 */
+const MAX_UPDATE_MESSAGE = 300
+/** 更新脚本 check / apply 的超时。 */
+const SCRIPT_UPDATE_TIMEOUT_MS = 60_000
+/** git fetch 的超时。 */
+const GIT_FETCH_TIMEOUT_MS = 60_000
+/** git pull 的超时。 */
+const GIT_PULL_TIMEOUT_MS = 120_000
+/** git ls-remote 的超时。 */
+const LS_REMOTE_TIMEOUT_MS = 30_000
+/** Python 解释器候选（Windows 上 `python3` 常是应用商店占位符，优先 python）。 */
+const PYTHON_INTERPRETERS = process.platform === 'win32' ? ['python', 'python3'] : ['python3', 'python']
+/** known 里属于更新检测缓存的字段（清单刷新时按路径继承）。 */
+const UPDATE_CACHE_KEYS = ['updateMethod', 'repoUrl', 'scriptPath', 'canApply', 'version', 'updateDetectPath']
 
 /* ------------------------------------------------------------------ *
  * 通用工具
@@ -310,6 +340,307 @@ function searchParamsOf(url) {
 }
 
 /* ------------------------------------------------------------------ *
+ * 更新检测工具（契约 v4 §1）
+ * ------------------------------------------------------------------ */
+
+/** 安全读取 UTF-8 文本文件。 */
+function readTextFileSafe(file) {
+  if (typeof file !== 'string' || file.length === 0) return undefined
+  try {
+    return fs.readFileSync(file, 'utf8')
+  } catch {
+    return undefined
+  }
+}
+
+/** 去掉 YAML 值两端的引号。 */
+function stripYamlQuotes(value) {
+  const text = typeof value === 'string' ? value.trim() : ''
+  if (text.length >= 2) {
+    const first = text[0]
+    const last = text[text.length - 1]
+    if ((first === '"' && last === '"') || (first === "'" && last === "'")) return text.slice(1, -1).trim()
+  }
+  return text
+}
+
+/**
+ * 极简 YAML frontmatter 解析：只取 `key: value` 与一层缩进子键（metadata.*）。
+ * 解析失败 / 无 frontmatter 一律返回空对象。
+ * @param {string} text - SKILL.md 内容。
+ * @returns {Record<string, string>} 扁平键值（子键以 `metadata.` 前缀）。
+ */
+function parseSkillFrontmatter(text) {
+  if (typeof text !== 'string') return {}
+  const lines = text.split(/\r?\n/)
+  if (lines.length === 0 || lines[0].trim() !== '---') return {}
+  let end = -1
+  for (let index = 1; index < lines.length; index += 1) {
+    if (lines[index].trim() === '---') {
+      end = index
+      break
+    }
+  }
+  if (end === -1) return {}
+  const flat = {}
+  let section
+  for (let index = 1; index < end; index += 1) {
+    const raw = lines[index]
+    const trimmed = raw.trim()
+    if (trimmed.length === 0 || trimmed.startsWith('#')) continue
+    const match = /^([A-Za-z0-9_.-]+):\s*(.*)$/.exec(trimmed)
+    if (match === null) continue
+    const key = match[1].toLowerCase()
+    const value = stripYamlQuotes(match[2])
+    const indented = raw.length - raw.trimStart().length > 0
+    if (indented && section !== undefined) {
+      flat[`${section}.${key}`] = value
+      continue
+    }
+    if (value.length > 0) flat[key] = value
+    section = key
+  }
+  return flat
+}
+
+/** 从 frontmatter 取版本号（metadata.version 优先，其次顶层 version）。 */
+function frontmatterVersion(flat) {
+  const candidates = [flat['metadata.version'], flat.version]
+  for (const candidate of candidates) {
+    if (typeof candidate === 'string' && VERSION_PATTERN.test(candidate.trim())) return candidate.trim()
+  }
+  return null
+}
+
+/** 从 frontmatter 取显式仓库地址。 */
+function frontmatterRepoUrl(flat) {
+  const keys = [
+    'metadata.repository', 'metadata.repo', 'metadata.homepage', 'metadata.source', 'metadata.url',
+    'repository', 'homepage', 'source', 'url',
+  ]
+  for (const key of keys) {
+    const candidate = flat[key]
+    if (typeof candidate === 'string' && /^https?:\/\//i.test(candidate.trim())) return candidate.trim()
+  }
+  return null
+}
+
+/**
+ * 规范化仓库地址：ssh / scp 转 https、去掉 .git 与尾部斜杠。
+ * @param {unknown} raw - 原始地址。
+ * @returns {string|null} 规范化地址；非法返回 null。
+ */
+function normalizeRepoUrl(raw) {
+  if (typeof raw !== 'string') return null
+  let text = raw.trim()
+  if (text.length === 0) return null
+  const scpMatch = /^git@([^:]+):(.+)$/.exec(text)
+  if (scpMatch !== null) text = `https://${scpMatch[1]}/${scpMatch[2]}`
+  else {
+    const sshMatch = /^ssh:\/\/git@([^/]+)\/(.+)$/.exec(text)
+    if (sshMatch !== null) text = `https://${sshMatch[1]}/${sshMatch[2]}`
+  }
+  if (!/^https?:\/\//i.test(text)) return null
+  text = text.replace(/\.git$/i, '').replace(/[?#].*$/, '').replace(/\/+$/, '')
+  return text.length > 0 ? text : null
+}
+
+/** 三段版本号（x.y / x.y.z）。 */
+function parseVersionTriple(value) {
+  if (typeof value !== 'string') return null
+  const match = /^(\d+)\.(\d+)(?:\.(\d+))?/.exec(value.trim())
+  if (match === null) return null
+  return [Number(match[1]), Number(match[2]), Number(match[3] ?? 0)]
+}
+
+/** 比较两个三段版本号。 */
+function compareVersionTriples(left, right) {
+  for (let index = 0; index < 3; index += 1) {
+    if (left[index] !== right[index]) return left[index] - right[index]
+  }
+  return 0
+}
+
+/**
+ * 从脚本 stdout 里挑一个版本号：优先高于当前版本的、最大的三段版本号；
+ * 找不到候选时返回 null。
+ * @param {string} text - stdout。
+ * @param {string|null} currentVersion - 当前版本。
+ * @returns {string|null}
+ */
+function parseLatestVersion(text, currentVersion) {
+  const candidates = []
+  for (const match of String(text).matchAll(VERSION_TRIPLE_IN_TEXT)) candidates.push(match[1])
+  if (candidates.length === 0) return null
+  const currentTriple = currentVersion === null ? null : parseVersionTriple(currentVersion)
+  if (currentTriple === null) return candidates[0]
+  let best = null
+  for (const candidate of candidates) {
+    const triple = parseVersionTriple(candidate)
+    if (triple === null) continue
+    if (compareVersionTriples(triple, currentTriple) <= 0) continue
+    if (best === null || compareVersionTriples(triple, best.triple) > 0) best = { text: candidate, triple }
+  }
+  return best === null ? candidates[0] : best.text
+}
+
+/**
+ * 从 `git ls-remote --tags --refs` 输出里取最高版本标签（去掉前导 v）。
+ * @param {string} stdout - ls-remote 输出。
+ * @returns {string|null}
+ */
+function highestTagVersion(stdout) {
+  let best = null
+  for (const line of String(stdout).split(/\r?\n/)) {
+    const match = /refs\/tags\/(\S+)\s*$/.exec(line.trim())
+    if (match === null) continue
+    const raw = match[1].replace(/^v/i, '')
+    if (!VERSION_PATTERN.test(raw)) continue
+    const triple = parseVersionTriple(raw)
+    if (triple === null) continue
+    if (best === null || compareVersionTriples(triple, best.triple) > 0) best = { text: raw, triple }
+  }
+  return best === null ? null : best.text
+}
+
+/** 解析 `.git/config` 里的 origin url。 */
+function gitConfigOriginUrl(gitDir) {
+  const text = readTextFileSafe(path.join(gitDir, 'config'))
+  if (typeof text !== 'string') return null
+  const section = /\[remote\s+"origin"\]\s*\n([\s\S]*?)(?=\n\[|$)/i.exec(text)
+  if (section === null) return null
+  const remoteMatch = /^\s*url\s*=\s*(.+)$/im.exec(section[1])
+  return remoteMatch === null ? null : normalizeRepoUrl(remoteMatch[1])
+}
+
+/** 解析 `.git`（目录或 worktree 的 gitdir 指针文件），返回真实 git 目录。 */
+function resolveGitDir(repoRoot) {
+  const candidate = path.join(repoRoot, '.git')
+  try {
+    const stats = fs.statSync(candidate)
+    if (stats.isDirectory()) return candidate
+    if (stats.isFile()) {
+      const text = readTextFileSafe(candidate) ?? ''
+      const pointer = /^gitdir:\s*(.+)$/im.exec(text)
+      if (pointer !== null) return path.resolve(repoRoot, pointer[1].trim())
+    }
+  } catch {
+    /* 不存在 */
+  }
+  return undefined
+}
+
+/**
+ * 从技能目录向上最多 4 层找 git 仓库。
+ * @param {string} startDir - 技能目录。
+ * @param {number} [maxLevels] - 最多上溯层数。
+ * @returns {{ repoRoot: string, gitDir: string }|undefined}
+ */
+function findGitRepo(startDir, maxLevels = 4) {
+  let dir = path.resolve(startDir)
+  for (let level = 0; level <= maxLevels; level += 1) {
+    const gitDir = resolveGitDir(dir)
+    if (gitDir !== undefined) return { repoRoot: dir, gitDir }
+    const parent = path.dirname(dir)
+    if (parent === dir) return undefined
+    dir = parent
+  }
+  return undefined
+}
+
+/** 检测技能目录下的更新脚本（.py 优先）。 */
+function findUpdateScript(skillDir) {
+  const candidates = [
+    { relative: path.join('scripts', 'check_update.py'), kind: 'py' },
+    { relative: 'check_update.py', kind: 'py' },
+    { relative: path.join('scripts', 'check_update.sh'), kind: 'sh' },
+    { relative: 'check_update.sh', kind: 'sh' },
+  ]
+  for (const candidate of candidates) {
+    const absolute = path.join(skillDir, candidate.relative)
+    if (pathExists(absolute)) return { scriptPath: absolute, kind: candidate.kind }
+  }
+  return undefined
+}
+
+/** 从 README 里找唯一 GitHub 仓库地址（0 个或多个不同候选时返回 null）。 */
+function readmeRepoUrl(skillDir) {
+  for (const name of ['README.md', 'readme.md', 'README.MD']) {
+    const text = readTextFileSafe(path.join(skillDir, name))
+    if (typeof text !== 'string') continue
+    const matches = [...text.matchAll(GITHUB_URL_PATTERN)].map((match) => normalizeRepoUrl(match[0]))
+    const distinct = [...new Set(matches.filter((url) => url !== null).map((url) => url.toLowerCase()))]
+    return distinct.length === 1 ? distinct[0] : null
+  }
+  return null
+}
+
+/**
+ * 检测一个已知技能的更新方式（纯同步、不抛异常、结果缓存进 known）。
+ * @param {{ path?: string, source?: string }} entry - state.known 条目。
+ * @returns {{ updateMethod: string, repoUrl: string|null, scriptPath: string|null, canApply: boolean, version: string|null }}
+ */
+function detectUpdateInfo(entry) {
+  const fallback = { updateMethod: 'none', repoUrl: null, scriptPath: null, canApply: false, version: null }
+  try {
+    if (entry === null || typeof entry !== 'object') return fallback
+    if (typeof entry.path !== 'string' || entry.path.length === 0) return fallback
+    const file = entry.path
+    const skillDir = path.dirname(file)
+    const flat = parseSkillFrontmatter(readTextFileSafe(file) ?? '')
+    const version = frontmatterVersion(flat)
+    const explicitRepo = frontmatterRepoUrl(flat)
+
+    // 内置技能（node_modules / bundled）只展示，不检测、不执行任何命令。
+    if (entry.source === 'bundled' || isInstalledPackagePath(file)) {
+      return { updateMethod: 'bundled', repoUrl: explicitRepo, scriptPath: null, canApply: false, version }
+    }
+
+    // 1) 更新脚本（.py 优先；.sh 在本机不支持）。
+    const script = findUpdateScript(skillDir)
+    if (script !== undefined) {
+      if (script.kind === 'sh') {
+        return { updateMethod: 'none', repoUrl: explicitRepo, scriptPath: script.scriptPath, canApply: false, version }
+      }
+      const text = readTextFileSafe(script.scriptPath) ?? ''
+      return {
+        updateMethod: 'script',
+        repoUrl: explicitRepo,
+        scriptPath: script.scriptPath,
+        canApply: text.includes('--update'),
+        version,
+      }
+    }
+
+    // 2) git 仓库：技能目录自身 / 其父目录 = 技能自己的仓库；更上层 = 上级项目仓库。
+    const repo = findGitRepo(skillDir)
+    if (repo !== undefined) {
+      const isOwnRepo = repo.repoRoot === skillDir || repo.repoRoot === path.dirname(skillDir)
+      return {
+        updateMethod: isOwnRepo ? 'git' : 'git-project',
+        repoUrl: gitConfigOriginUrl(repo.gitDir) ?? explicitRepo,
+        scriptPath: null,
+        canApply: isOwnRepo,
+        version,
+      }
+    }
+
+    // 3) 仅 metadata：frontmatter 版本 / 显式仓库地址，或 README 里唯一仓库链接。
+    const readmeUrl = explicitRepo === null ? readmeRepoUrl(skillDir) : null
+    if (explicitRepo !== null || readmeUrl !== null) {
+      return { updateMethod: 'metadata', repoUrl: explicitRepo ?? readmeUrl, scriptPath: null, canApply: false, version }
+    }
+    // 只有版本、没有任何仓库地址：保留版本展示，但菜单按「无关联代码仓」处理。
+    if (version !== null) {
+      return { updateMethod: 'none', repoUrl: null, scriptPath: null, canApply: false, version }
+    }
+    return fallback
+  } catch {
+    return fallback
+  }
+}
+
+/* ------------------------------------------------------------------ *
  * 状态文件
  * ------------------------------------------------------------------ */
 
@@ -321,6 +652,7 @@ function emptyState() {
     bindings: {},
     known: {},
     tags: {},
+    updates: {},
     stats: { updatedAt: 0, sessions: {} },
   }
 }
@@ -352,6 +684,13 @@ function sanitizeKnownEntry(raw) {
   if (installedAt > 0) entry.installedAt = installedAt
   const updatedAt = toNonNegativeInt(raw.updatedAt)
   if (updatedAt > 0) entry.updatedAt = updatedAt
+  // 契约 v4：更新检测缓存（路径不变时直接复用，避免重复扫盘）。
+  if (typeof raw.updateMethod === 'string' && UPDATE_METHODS.has(raw.updateMethod)) entry.updateMethod = raw.updateMethod
+  if (typeof raw.repoUrl === 'string' && raw.repoUrl.length > 0) entry.repoUrl = raw.repoUrl
+  if (typeof raw.scriptPath === 'string' && raw.scriptPath.length > 0) entry.scriptPath = raw.scriptPath
+  if (typeof raw.canApply === 'boolean') entry.canApply = raw.canApply
+  if (typeof raw.version === 'string' && VERSION_PATTERN.test(raw.version)) entry.version = raw.version
+  if (typeof raw.updateDetectPath === 'string' && raw.updateDetectPath.length > 0) entry.updateDetectPath = raw.updateDetectPath
   return entry
 }
 
@@ -371,6 +710,13 @@ function sameKnown(left, right) {
     if (before.provider !== after.provider) return false
     if (before.installedAt !== after.installedAt) return false
     if (before.updatedAt !== after.updatedAt) return false
+    // 检测缓存字段（契约 v4）：变化时同样需要落盘。
+    if (before.updateMethod !== after.updateMethod) return false
+    if (before.repoUrl !== after.repoUrl) return false
+    if (before.scriptPath !== after.scriptPath) return false
+    if (before.canApply !== after.canApply) return false
+    if (before.version !== after.version) return false
+    if (before.updateDetectPath !== after.updateDetectPath) return false
   }
   return true
 }
@@ -387,6 +733,21 @@ function sanitizeTagEntry(raw) {
   // 全空记录不落盘。
   if (entry.ai.length === 0 && entry.user.length === 0 && entry.muted.length === 0) return null
   return entry
+}
+
+/** 校验并收敛一条更新记录（契约 v4）；损坏/空记录返回 null。 */
+function sanitizeUpdateRecord(raw) {
+  if (raw === null || typeof raw !== 'object' || Array.isArray(raw)) return null
+  const stateValue = typeof raw.state === 'string' && UPDATE_STATES.has(raw.state) ? raw.state : 'unknown'
+  const record = {
+    // `checking` 是运行态；落盘后读到说明上次运行被中断，回退为 unknown。
+    state: stateValue === 'checking' ? 'unknown' : stateValue,
+    latest: typeof raw.latest === 'string' && raw.latest.length > 0 ? raw.latest.slice(0, 100) : null,
+    message: typeof raw.message === 'string' && raw.message.length > 0 ? raw.message.slice(0, MAX_UPDATE_MESSAGE) : null,
+    checkedAt: toNonNegativeInt(raw.checkedAt),
+  }
+  if (record.state === 'unknown' && record.latest === null && record.message === null && record.checkedAt === 0) return null
+  return record
 }
 
 /** 把磁盘上的任意 JSON 收敛为合法状态；损坏时回退默认值。 */
@@ -452,6 +813,15 @@ function sanitizeState(raw) {
       if (!isSkillName(skillName)) continue
       const entry = sanitizeTagEntry(value)
       if (entry !== null) state.tags[skillName] = entry
+    }
+  }
+
+  // 契约 v4：更新记录（与 tags 同规则：只读同版本文件、未知技能名在清单刷新时剪除）。
+  if (currentVersion && raw.updates !== null && typeof raw.updates === 'object' && !Array.isArray(raw.updates)) {
+    for (const [skillName, value] of Object.entries(raw.updates)) {
+      if (!isSkillName(skillName)) continue
+      const record = sanitizeUpdateRecord(value)
+      if (record !== null) state.updates[skillName] = record
     }
   }
 
@@ -624,12 +994,19 @@ export function apply(ctx, config) {
       }
     }
 
+    const updates = {}
+    for (const skillName of Object.keys(state.updates).sort()) {
+      const record = sanitizeUpdateRecord(state.updates[skillName])
+      if (record !== null) updates[skillName] = record
+    }
+
     return {
       version: STATE_VERSION,
       disabled,
       bindings,
       known,
       tags,
+      updates,
       stats: { updatedAt: toNonNegativeInt(state.stats.updatedAt), sessions },
     }
   }
@@ -1004,8 +1381,9 @@ export function apply(ctx, config) {
           merged[skillName] = existing
         }
 
-        // 3) 仅当所有来源都完整成功时，才剪掉已不存在的条目（含其标签记录）。
+        // 3) 仅当所有来源都完整成功时，才剪掉已不存在的条目（含其标签 / 更新记录）。
         let tagsPruned = false
+        let updatesPruned = false
         if (collected.allComplete) {
           for (const skillName of Object.keys(merged)) {
             if (pinned.has(skillName)) continue
@@ -1017,6 +1395,44 @@ export function apply(ctx, config) {
             delete state.tags[skillName]
             tagsPruned = true
           }
+          for (const skillName of Object.keys(state.updates)) {
+            if (merged[skillName] !== undefined) continue
+            delete state.updates[skillName]
+            updatesPruned = true
+          }
+        }
+
+        // 4) 契约 v4：只为「新增 / 路径变化」的技能检测更新方式；检测结果缓存进 known，
+        //    后续刷新直接复用（不重复扫盘），所以 GET 永远不需要执行命令或读脚本。
+        for (const skillName of Object.keys(merged)) {
+          let entry = merged[skillName]
+          if (entry === null || typeof entry !== 'object') continue
+          if (typeof entry.path !== 'string' || entry.path.length === 0) continue
+          // 注册表快照每轮都会生成新的 summary 对象；同一路径时把上次的检测缓存继承过来。
+          const cached = state.known[skillName]
+          if (cached !== null && typeof cached === 'object' && cached !== entry && cached.path === entry.path && cached.updateMethod !== undefined) {
+            const inherited = { ...entry }
+            for (const key of UPDATE_CACHE_KEYS) {
+              if (cached[key] !== undefined) inherited[key] = cached[key]
+              else delete inherited[key]
+            }
+            entry = inherited
+            merged[skillName] = entry
+          }
+          if (entry.updateMethod !== undefined && entry.updateDetectPath === entry.path) continue
+          const detection = detectUpdateInfo(entry)
+          // 拷贝再改，避免与 state.known 共享引用导致 sameKnown 无法发现变化。
+          const next = { ...entry }
+          next.updateMethod = detection.updateMethod
+          next.canApply = detection.canApply
+          next.updateDetectPath = next.path
+          if (detection.version !== null) next.version = detection.version
+          else delete next.version
+          if (detection.repoUrl !== null) next.repoUrl = detection.repoUrl
+          else delete next.repoUrl
+          if (detection.scriptPath !== null) next.scriptPath = detection.scriptPath
+          else delete next.scriptPath
+          merged[skillName] = next
         }
 
         const changed = !sameKnown(state.known, merged)
@@ -1024,7 +1440,7 @@ export function apply(ctx, config) {
         inventoryReady = true
         inventoryUpdatedAt = Date.now()
         inventoryRetryAt = 0
-        if (changed || tagsPruned) {
+        if (changed || tagsPruned || updatesPruned) {
           persist()
           invalidate()
         }
@@ -1585,6 +2001,474 @@ export function apply(ctx, config) {
     }
   }
 
+  /* ------------------- 更新检测结果 / 更新执行（契约 v4） ------------------- */
+
+  /** 命令执行器：默认 spawnSync；测试可通过 apply(config.commandRunner) 注入假实现。 */
+  const spawnCommand = config !== null && typeof config === 'object' && typeof config.commandRunner === 'function'
+    ? config.commandRunner
+    : spawnSync
+  /** 单技能更新命令的单飞表（name → Promise）。 */
+  const updateInFlight = new Map()
+  /** 每个技能选中的 Python 解释器（避免每次重试 python3 → python）。 */
+  const pythonInterpreterCache = new Map()
+
+  /** 统一 spawn 结果形状（超时/ENOENT 也能安全判定）。 */
+  function normalizeCommandResult(result) {
+    const normalized = { status: null, stdout: '', stderr: '', timedOut: false, errorCode: undefined }
+    if (result === null || typeof result !== 'object') return normalized
+    if (typeof result.status === 'number') normalized.status = result.status
+    if (typeof result.stdout === 'string') normalized.stdout = result.stdout
+    if (typeof result.stderr === 'string') normalized.stderr = result.stderr
+    if (result.error !== null && typeof result.error === 'object' && typeof result.error.code === 'string') {
+      normalized.errorCode = result.error.code
+      if (result.error.code === 'ETIMEDOUT') normalized.timedOut = true
+    }
+    if (result.signal === 'SIGTERM' || result.signal === 'SIGKILL') normalized.timedOut = true
+    return normalized
+  }
+
+  /**
+   * 执行一条命令（永不使用 shell）。
+   * @param {string} file - 可执行文件。
+   * @param {string[]} args - 参数（外部只允许追加固定的 --update）。
+   * @param {{ cwd?: string, timeout?: number }} options - cwd / 超时。
+   * @returns {{ status: number|null, stdout: string, stderr: string, timedOut: boolean, errorCode?: string }}
+   */
+  function runCommand(file, args, options = {}) {
+    const commandOptions = {
+      cwd: typeof options.cwd === 'string' ? options.cwd : undefined,
+      timeout: Number.isFinite(options.timeout) ? options.timeout : SCRIPT_UPDATE_TIMEOUT_MS,
+      windowsHide: true,
+      encoding: 'utf8',
+      env: { ...process.env, GIT_TERMINAL_PROMPT: '0', GIT_ASKPASS: 'echo' },
+    }
+    try {
+      return normalizeCommandResult(spawnCommand(file, args, commandOptions))
+    } catch (err) {
+      return normalizeCommandResult({ error: { code: err && typeof err.code === 'string' ? err.code : 'SPAWN-FAILED' }, stderr: String(err && err.message ? err.message : err) })
+    }
+  }
+
+  /** stderr 尾部（≤300 字）。 */
+  function stderrTail(text) {
+    const value = typeof text === 'string' ? text.trim() : ''
+    if (value.length === 0) return ''
+    return value.length > MAX_UPDATE_MESSAGE ? value.slice(-MAX_UPDATE_MESSAGE) : value
+  }
+
+  /** stdout 的第一条非空行（≤300 字）。 */
+  function firstNonEmptyLine(text) {
+    if (typeof text !== 'string') return ''
+    for (const line of text.split(/\r?\n/)) {
+      const trimmed = line.trim()
+      if (trimmed.length > 0) return truncateText(trimmed, MAX_UPDATE_MESSAGE)
+    }
+    return ''
+  }
+
+  /** 写一条更新记录并落盘。 */
+  function storeUpdateRecord(name, patch) {
+    const record = {
+      state: patch && UPDATE_STATES.has(patch.state) ? patch.state : 'unknown',
+      latest: patch && typeof patch.latest === 'string' && patch.latest.length > 0 ? patch.latest.slice(0, 100) : null,
+      message: patch && typeof patch.message === 'string' && patch.message.length > 0 ? truncateText(patch.message, MAX_UPDATE_MESSAGE) : null,
+      checkedAt: Date.now(),
+    }
+    state.updates[name] = record
+    persist()
+  }
+
+  /** 让某技能的检测缓存失效（更新成功后需要重新读版本号）。 */
+  function invalidateUpdateDetection(name) {
+    const entry = state.known[name]
+    if (entry === null || typeof entry !== 'object') return
+    delete entry.updateMethod
+    delete entry.canApply
+    delete entry.version
+    delete entry.repoUrl
+    delete entry.scriptPath
+    delete entry.updateDetectPath
+  }
+
+  /** 确保某技能已有检测缓存（缺失时同步检测一次并落盘）。 */
+  function ensureUpdateDetection(name) {
+    const entry = state.known[name]
+    if (entry === null || typeof entry !== 'object') return
+    if (typeof entry.path !== 'string' || entry.path.length === 0) return
+    if (entry.updateMethod !== undefined && entry.updateDetectPath === entry.path) return
+    const detection = detectUpdateInfo(entry)
+    entry.updateMethod = detection.updateMethod
+    entry.canApply = detection.canApply
+    entry.updateDetectPath = entry.path
+    if (detection.version !== null) entry.version = detection.version
+    else delete entry.version
+    if (detection.repoUrl !== null) entry.repoUrl = detection.repoUrl
+    else delete entry.repoUrl
+    if (detection.scriptPath !== null) entry.scriptPath = detection.scriptPath
+    else delete entry.scriptPath
+    persist()
+  }
+
+  /** payload.skills[].update：持久记录 + 实时 busy + 检测默认值。 */
+  function updateViewFor(name) {
+    const entry = state.known[name]
+    const method = entry && UPDATE_METHODS.has(entry.updateMethod) ? entry.updateMethod : 'none'
+    const canApply = Boolean(entry && entry.canApply === true)
+    const record = state.updates[name]
+    let viewState = 'unknown'
+    let latest = null
+    let message = null
+    let checkedAt = 0
+    if (record !== null && typeof record === 'object' && UPDATE_STATES.has(record.state)) {
+      viewState = record.state
+      latest = typeof record.latest === 'string' ? record.latest : null
+      message = typeof record.message === 'string' ? record.message : null
+      checkedAt = toNonNegativeInt(record.checkedAt)
+    } else if (method === 'bundled') {
+      viewState = 'not-applicable'
+      message = '内置技能随 DSH / 插件更新'
+    } else if (method === 'none') {
+      viewState = 'not-applicable'
+      message = entry !== undefined && typeof entry.scriptPath === 'string' ? '仅支持 Python 更新脚本' : '无关联代码仓'
+    } else if (method === 'git-project') {
+      message = '属于上级项目仓库，请随项目更新'
+    }
+    return {
+      method,
+      state: viewState,
+      latest,
+      message,
+      checkedAt,
+      canApply,
+      busy: updateInFlight.has(name),
+    }
+  }
+
+  /** 用选中的解释器跑 Python 脚本（python3 → python 回退，按技能缓存选择）。 */
+  function runPythonScript(name, scriptPath, dir, args) {
+    const cached = pythonInterpreterCache.get(name)
+    const interpreters = cached === undefined ? PYTHON_INTERPRETERS : [cached]
+    let last = normalizeCommandResult(undefined)
+    for (const interpreter of interpreters) {
+      const result = runCommand(interpreter, [scriptPath, ...args], { cwd: dir, timeout: SCRIPT_UPDATE_TIMEOUT_MS })
+      last = result
+      if (result.errorCode === 'ENOENT') continue
+      pythonInterpreterCache.set(name, interpreter)
+      return result
+    }
+    return last
+  }
+
+  /**
+   * Oil 系列技能（check_update.py）会把最近一次成功联网的版本写进
+   * LOCALAPPDATA/oil/<name>-update.json（非 win32 用 XDG_STATE_HOME/~/.local/state）。
+   * 仅当脚本本身就是 check_update.py 时读取，作为「脚本静默时」的补充信息。
+   * @returns {{latest: string, checkedAt: number, failedAt: number} | undefined}
+   */
+  function readOilScriptCache(name) {
+    try {
+      const base = process.platform === 'win32'
+        ? (process.env.LOCALAPPDATA ?? path.join(os.homedir(), 'AppData', 'Local'))
+        : (process.env.XDG_STATE_HOME ?? path.join(os.homedir(), '.local', 'state'))
+      const file = path.join(base, 'oil', `${name}-update.json`)
+      if (!pathExists(file)) return undefined
+      const raw = JSON.parse(fs.readFileSync(file, 'utf8'))
+      const latest = typeof raw.latest === 'string' ? raw.latest : null
+      const checkedAt = typeof raw.checked_at === 'number' ? raw.checked_at * 1000 : 0
+      const failedAt = typeof raw.fetch_failed_at === 'number' ? raw.fetch_failed_at * 1000 : 0
+      if (latest === null) return undefined
+      return { latest, checkedAt, failedAt }
+    } catch {
+      return undefined
+    }
+  }
+
+  /** 更新脚本方式：check / apply。 */
+  async function runScriptUpdate(name, entry, apply) {
+    const file = entry.path
+    if (typeof file !== 'string' || file.length === 0) {
+      storeUpdateRecord(name, { state: 'failed', message: '未找到技能目录' })
+      return
+    }
+    const dir = path.dirname(file)
+    let scriptPath = typeof entry.scriptPath === 'string' && pathExists(entry.scriptPath) ? entry.scriptPath : undefined
+    if (scriptPath === undefined) {
+      const found = findUpdateScript(dir)
+      scriptPath = found === undefined ? undefined : found.scriptPath
+    }
+    if (scriptPath === undefined || !pathExists(scriptPath)) {
+      storeUpdateRecord(name, { state: 'failed', message: '未找到更新脚本' })
+      return
+    }
+    const currentVersion = typeof entry.version === 'string' ? entry.version : null
+    const check = runPythonScript(name, scriptPath, dir, [])
+    if (check.timedOut) {
+      storeUpdateRecord(name, { state: 'failed', message: '检查超时' })
+      return
+    }
+    if (check.errorCode === 'ENOENT') {
+      storeUpdateRecord(name, { state: 'failed', message: '未找到 Python 解释器' })
+      return
+    }
+    if (check.status !== 0) {
+      storeUpdateRecord(name, { state: 'failed', message: stderrTail(check.stderr) || `更新脚本退出码 ${check.status ?? '?'}` })
+      return
+    }
+    const stdout = check.stdout.trim()
+    let latest = null
+    let availableReason = null
+    if (stdout.length === 0) {
+      // 脚本约定：无输出 = 没有新版本 / 网络失败 / 开发目录里运行。
+      // Oil 类脚本会把最近一次成功联网的版本缓存在本地，可据此补一条「可更新」提示。
+      const cached = path.basename(scriptPath) === 'check_update.py' ? readOilScriptCache(name) : undefined
+      if (cached !== undefined) {
+        const currentTriple = currentVersion === null ? null : parseVersionTriple(currentVersion)
+        const cachedTriple = parseVersionTriple(cached.latest)
+        const when = cached.checkedAt > 0 ? new Date(cached.checkedAt).toISOString().slice(0, 10) : '未知日期'
+        if (currentTriple !== null && cachedTriple !== null && compareVersionTriples(cachedTriple, currentTriple) > 0) {
+          latest = cached.latest
+          availableReason = `上游版本 ${cached.latest}（脚本缓存于 ${when}）`
+        } else if (currentTriple !== null) {
+          storeUpdateRecord(name, { state: 'up-to-date', latest: currentVersion, message: `已是最新（缓存 ${cached.latest}，${when}）` })
+          return
+        }
+      }
+      if (latest === null) {
+        storeUpdateRecord(name, { state: 'unknown', message: '脚本未报告更新（可能已是最新或暂时无法联网）' })
+        return
+      }
+    } else {
+      latest = parseLatestVersion(stdout, currentVersion)
+      availableReason = firstNonEmptyLine(stdout)
+    }
+    storeUpdateRecord(name, { state: 'available', latest, message: availableReason })
+    if (!apply) return
+    if (entry.canApply !== true) {
+      storeUpdateRecord(name, { state: 'not-applicable', latest, message: '更新脚本不支持 --update' })
+      return
+    }
+    // 固定参数 + 仅追加 --update（不经过 shell）。
+    const update = runPythonScript(name, scriptPath, dir, ['--update'])
+    if (update.timedOut) {
+      storeUpdateRecord(name, { state: 'failed', latest, message: '更新超时' })
+      return
+    }
+    if (update.status !== 0) {
+      storeUpdateRecord(name, { state: 'failed', latest, message: stderrTail(update.stderr) || `更新脚本退出码 ${update.status ?? '?'}` })
+      return
+    }
+    const marked = /已自动更新|updated/i.test(update.stdout)
+    invalidateUpdateDetection(name)
+    await refreshInventory()
+    const fresh = state.known[name]
+    const freshVersion = fresh && typeof fresh.version === 'string' ? fresh.version : null
+    const versionChanged = freshVersion !== null && freshVersion !== currentVersion
+    if (marked || versionChanged) {
+      storeUpdateRecord(name, { state: 'updated', latest: freshVersion ?? latest, message: firstNonEmptyLine(update.stdout) || '已更新' })
+    } else {
+      storeUpdateRecord(name, { state: 'failed', latest, message: '更新脚本未报告成功' })
+    }
+  }
+
+  /** 执行 git 命令（cwd 固定为仓库根，参数不含用户输入）。 */
+  function runGit(repoRoot, args, timeout) {
+    return runCommand('git', ['-C', repoRoot, ...args], { cwd: repoRoot, timeout })
+  }
+
+  /** git / git-project：fetch + 落后提交数；仅 method=git 且干净仓库允许 pull。 */
+  async function runGitUpdate(name, entry, apply, method) {
+    const file = entry.path
+    if (typeof file !== 'string' || file.length === 0) {
+      storeUpdateRecord(name, { state: 'failed', message: '未找到技能目录' })
+      return
+    }
+    const repo = findGitRepo(path.dirname(file))
+    if (repo === undefined) {
+      storeUpdateRecord(name, { state: 'failed', message: '未找到 git 仓库' })
+      return
+    }
+    const repoRoot = repo.repoRoot
+    const currentVersion = typeof entry.version === 'string' ? entry.version : null
+    const fetch = runGit(repoRoot, ['fetch', '--quiet'], GIT_FETCH_TIMEOUT_MS)
+    if (fetch.timedOut) {
+      storeUpdateRecord(name, { state: 'failed', message: '检查超时' })
+      return
+    }
+    if (fetch.errorCode === 'ENOENT') {
+      storeUpdateRecord(name, { state: 'failed', message: '未找到 git 命令' })
+      return
+    }
+    if (fetch.status !== 0) {
+      storeUpdateRecord(name, { state: 'failed', message: stderrTail(fetch.stderr) || 'git fetch 失败' })
+      return
+    }
+    let upstream = ''
+    const upstreamResult = runGit(repoRoot, ['rev-parse', '--abbrev-ref', '--symbolic-full-name', '@{u}'], GIT_FETCH_TIMEOUT_MS)
+    if (upstreamResult.status === 0) upstream = upstreamResult.stdout.trim()
+    let behind = null
+    let latest = null
+    if (upstream.length > 0) {
+      const countResult = runGit(repoRoot, ['rev-list', '--count', `HEAD..${upstream}`], GIT_FETCH_TIMEOUT_MS)
+      if (countResult.status === 0) {
+        const parsed = Number.parseInt(countResult.stdout.trim(), 10)
+        if (Number.isFinite(parsed) && parsed >= 0) behind = parsed
+      }
+      if (behind !== null && behind > 0) {
+        const shaResult = runGit(repoRoot, ['rev-parse', '--short', upstream], GIT_FETCH_TIMEOUT_MS)
+        if (shaResult.status === 0 && shaResult.stdout.trim().length > 0) latest = shaResult.stdout.trim()
+      }
+    }
+    // 没有 upstream 时退化为 ls-remote origin HEAD 与本地 HEAD 比较（-1 = 有更新但计数未知）。
+    if (behind === null) {
+      const remoteHead = runGit(repoRoot, ['ls-remote', 'origin', 'HEAD'], GIT_FETCH_TIMEOUT_MS)
+      const localHead = runGit(repoRoot, ['rev-parse', 'HEAD'], GIT_FETCH_TIMEOUT_MS)
+      if (remoteHead.status === 0 && localHead.status === 0) {
+        const remoteSha = (remoteHead.stdout.trim().split(/\s+/)[0] ?? '')
+        const localSha = localHead.stdout.trim()
+        if (remoteSha.length > 0 && localSha.length > 0) {
+          if (remoteSha === localSha) behind = 0
+          else {
+            behind = -1
+            latest = remoteSha.slice(0, 7)
+          }
+        }
+      }
+    }
+    if (behind === null) {
+      storeUpdateRecord(name, { state: 'failed', message: '无法确定上游分支' })
+      return
+    }
+    if (behind === 0) {
+      storeUpdateRecord(name, { state: 'up-to-date', latest: currentVersion, message: '已是最新' })
+      return
+    }
+    storeUpdateRecord(name, {
+      state: 'available',
+      latest,
+      message: behind > 0 ? `落后 ${behind} 个提交` : '落后远程更新',
+    })
+    if (!apply) return
+    if (method === 'git-project' || entry.canApply !== true) {
+      storeUpdateRecord(name, { state: 'not-applicable', latest, message: '属于上级项目仓库，请随项目更新' })
+      return
+    }
+    const statusResult = runGit(repoRoot, ['status', '--porcelain'], GIT_FETCH_TIMEOUT_MS)
+    if (statusResult.status !== 0) {
+      storeUpdateRecord(name, { state: 'failed', latest, message: 'git status 失败' })
+      return
+    }
+    if (statusResult.stdout.trim().length > 0) {
+      storeUpdateRecord(name, { state: 'failed', latest, message: '仓库有未提交的改动，已停止更新' })
+      return
+    }
+    const pull = runGit(repoRoot, ['pull', '--ff-only'], GIT_PULL_TIMEOUT_MS)
+    if (pull.timedOut) {
+      storeUpdateRecord(name, { state: 'failed', latest, message: '更新超时' })
+      return
+    }
+    if (pull.status !== 0) {
+      storeUpdateRecord(name, { state: 'failed', latest, message: stderrTail(pull.stderr) || 'git pull --ff-only 失败' })
+      return
+    }
+    invalidateUpdateDetection(name)
+    await refreshInventory()
+    const fresh = state.known[name]
+    const freshVersion = fresh && typeof fresh.version === 'string' ? fresh.version : null
+    storeUpdateRecord(name, { state: 'updated', latest: freshVersion ?? currentVersion, message: '已更新到最新' })
+  }
+
+  /** metadata：ls-remote 标签比对；无更新方式，apply 直接 not-applicable。 */
+  async function runMetadataUpdate(name, entry, apply) {
+    if (apply) {
+      storeUpdateRecord(name, { state: 'not-applicable', message: '未检测到更新方式，请在代码仓手动更新' })
+      return
+    }
+    const repoUrl = typeof entry.repoUrl === 'string' && entry.repoUrl.length > 0 ? entry.repoUrl : null
+    if (repoUrl === null) {
+      storeUpdateRecord(name, { state: 'failed', message: '未配置代码仓地址' })
+      return
+    }
+    const currentVersion = typeof entry.version === 'string' ? entry.version : null
+    const result = runCommand('git', ['ls-remote', '--tags', '--refs', repoUrl], { timeout: LS_REMOTE_TIMEOUT_MS })
+    if (result.timedOut) {
+      storeUpdateRecord(name, { state: 'failed', message: '检查超时' })
+      return
+    }
+    if (result.errorCode === 'ENOENT') {
+      storeUpdateRecord(name, { state: 'failed', message: '未找到 git 命令' })
+      return
+    }
+    if (result.status !== 0) {
+      storeUpdateRecord(name, { state: 'failed', message: stderrTail(result.stderr) || 'git ls-remote 失败' })
+      return
+    }
+    const best = highestTagVersion(result.stdout)
+    if (best === null) {
+      if (currentVersion === null) storeUpdateRecord(name, { state: 'unknown', message: '未找到版本标签' })
+      else storeUpdateRecord(name, { state: 'up-to-date', latest: currentVersion, message: '未找到版本标签' })
+      return
+    }
+    const bestTriple = parseVersionTriple(best)
+    const currentTriple = currentVersion === null ? null : parseVersionTriple(currentVersion)
+    if (bestTriple === null || (currentTriple !== null && compareVersionTriples(bestTriple, currentTriple) <= 0)) {
+      storeUpdateRecord(name, { state: 'up-to-date', latest: currentVersion ?? best, message: '已是最新' })
+      return
+    }
+    storeUpdateRecord(name, {
+      state: currentVersion === null ? 'unknown' : 'available',
+      latest: best,
+      message: currentVersion === null ? `最新标签 ${best}（未记录当前版本）` : `发现新版本 ${best}`,
+    })
+  }
+
+  /** 执行一次更新流程（按检测到的方式分派；异常一律落到 failed）。 */
+  async function performSkillUpdate(name, apply) {
+    const entry = state.known[name]
+    const method = entry && UPDATE_METHODS.has(entry.updateMethod) ? entry.updateMethod : 'none'
+    if (entry === undefined) {
+      storeUpdateRecord(name, { state: 'failed', message: '技能不存在' })
+      return
+    }
+    if (method === 'bundled') {
+      storeUpdateRecord(name, { state: 'not-applicable', message: '内置技能请通过 DSH 插件更新' })
+      return
+    }
+    if (method === 'none') {
+      const message = typeof entry.scriptPath === 'string' ? '仅支持 Python 更新脚本' : '无关联代码仓'
+      storeUpdateRecord(name, { state: 'not-applicable', message })
+      return
+    }
+    storeUpdateRecord(name, { state: 'checking' })
+    try {
+      if (method === 'script') await runScriptUpdate(name, entry, apply)
+      else if (method === 'metadata') await runMetadataUpdate(name, entry, apply)
+      else await runGitUpdate(name, entry, apply, method)
+    } catch (err) {
+      storeUpdateRecord(name, { state: 'failed', message: truncateText(err && err.message !== undefined ? err.message : err, MAX_UPDATE_MESSAGE) })
+    }
+  }
+
+  /**
+   * 单技能单飞执行：并发调用（含同一技能的 check/apply）只会有一个命令在跑，
+   * 后者直接返回（payload 里能看到 busy=true）。
+   * @param {string} name - 技能名。
+   * @param {boolean} apply - 是否执行更新。
+   */
+  async function runSkillUpdateAction(name, apply) {
+    if (updateInFlight.has(name)) return
+    const task = (async () => {
+      try {
+        await performSkillUpdate(name, apply)
+      } catch (err) {
+        storeUpdateRecord(name, { state: 'failed', message: truncateText(err && err.message !== undefined ? err.message : err, MAX_UPDATE_MESSAGE) })
+      } finally {
+        updateInFlight.delete(name)
+      }
+    })()
+    updateInFlight.set(name, task)
+    await task
+  }
+
   /* ---------------------- 工作区选择器（契约 v2 §D） ---------------------- */
 
   /**
@@ -1667,6 +2551,10 @@ export function apply(ctx, config) {
         updatedAt: updatedAt > 0 ? updatedAt : null,
         tags,
         mutedTags,
+        // 契约 v4：版本 / 代码仓 / 更新状态（GET 只读缓存，不执行任何命令）。
+        version: typeof entry.version === 'string' ? entry.version : null,
+        repoUrl: typeof entry.repoUrl === 'string' ? entry.repoUrl : null,
+        update: updateViewFor(skillName),
       })
     }
     skills.sort((left, right) => (left.name < right.name ? -1 : left.name > right.name ? 1 : 0))
@@ -2209,6 +3097,17 @@ export function apply(ctx, config) {
       case 'tagNow': {
         // 立刻强制跑一轮（不等待结果），客户端轮询 tagging.running/queued。
         kickTagNow()
+        break
+      }
+      case 'skillUpdate': {
+        // 契约 v4：检查 / 执行更新。发起请求等到命令结束；并发请求看到 busy=true 立即返回。
+        const skillName = body?.name
+        if (!isSkillName(skillName)) throw invalidRequest('name 必须匹配 ^[a-z0-9][a-z0-9-]{0,63}$')
+        if (body.apply !== undefined && typeof body.apply !== 'boolean') throw invalidRequest('apply 必须是布尔值')
+        const apply = body.apply === true
+        if (!(await ensureKnownSkill(skillName))) throw notFound(`技能 "${skillName}" 不存在`)
+        ensureUpdateDetection(skillName)
+        await runSkillUpdateAction(skillName, apply)
         break
       }
       case 'reportClientError': {
