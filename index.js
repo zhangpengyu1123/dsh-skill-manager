@@ -2229,7 +2229,7 @@ export function apply(ctx, config) {
           latest = cached.latest
           availableReason = `上游版本 ${cached.latest}（脚本缓存于 ${when}）`
         } else if (currentTriple !== null) {
-          storeUpdateRecord(name, { state: 'up-to-date', latest: currentVersion, message: `已是最新（缓存 ${cached.latest}，${when}）` })
+          storeUpdateRecord(name, { state: 'up-to-date', latest: currentVersion, message: `已是最新（${currentVersion}）` })
           return
         }
       }
@@ -2265,9 +2265,23 @@ export function apply(ctx, config) {
     const versionChanged = freshVersion !== null && freshVersion !== currentVersion
     if (marked || versionChanged) {
       storeUpdateRecord(name, { state: 'updated', latest: freshVersion ?? latest, message: firstNonEmptyLine(update.stdout) || '已更新' })
-    } else {
-      storeUpdateRecord(name, { state: 'failed', latest, message: '更新脚本未报告成功' })
+      return
     }
+    // 脚本 0 退出但没更新成功：优先转述脚本自己的提示；静默退出时给出可执行的下一步。
+    let detail = firstNonEmptyLine(update.stdout) || firstNonEmptyLine(update.stderr) || null
+    if (detail === null) {
+      const cached = path.basename(scriptPath) === 'check_update.py' ? readOilScriptCache(name) : undefined
+      const backoff = cached !== undefined && cached.failedAt > 0 && Date.now() - cached.failedAt < 60 * 60 * 1000
+      const manual = `python "${scriptPath}" --update`
+      if (backoff) {
+        detail = `更新脚本最近联网失败，正处于 1 小时退避期，本次没有执行更新。可稍后重试，或在终端手动运行：${manual}`
+      } else if (cached !== undefined) {
+        detail = `脚本静默退出、未报告更新（上游 ${cached.latest}）。可在终端手动运行：${manual}`
+      } else {
+        detail = '脚本静默退出、未报告更新（可能已是最新、未授权或联网失败）。'
+      }
+    }
+    storeUpdateRecord(name, { state: 'failed', latest, message: detail })
   }
 
   /** 执行 git 命令（cwd 固定为仓库根，参数不含用户输入）。 */
